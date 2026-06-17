@@ -51,7 +51,9 @@ impl OpHandler for UtilityHandler {
         let node_name = if !node.name.is_empty() {
             node.name.as_str().to_string()
         } else {
-            "unnamed".to_string()
+            node.output.first()
+                .map(|s| crate::onnx::convert::sanitize_identifier(s))
+                .unwrap_or_else(|| node.op_type.to_string())
         };
 
         match op_type {

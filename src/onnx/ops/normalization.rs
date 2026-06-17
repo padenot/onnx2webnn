@@ -32,7 +32,9 @@ impl OpHandler for NormalizationHandler {
         let node_name = if !node.name.is_empty() {
             node.name.clone()
         } else {
-            "unnamed".to_string()
+            node.output.first()
+                .map(|s| crate::onnx::convert::sanitize_identifier(s))
+                .unwrap_or_else(|| node.op_type.to_string())
         };
 
         match op_type {
