@@ -41,6 +41,114 @@ pub struct ValidatedGraph<'ctx> {
     pub graph: MLGraph<'ctx>,
 }
 
+impl<'ctx> ValidatedGraph<'ctx> {
+    /// Run inference through rustnn's WebNN dispatch — NOT through raw ORT.
+    ///
+    /// `inputs`: map of input name → flat f32 data + shape.
+    /// Returns: map of output name → (flat f32 data, shape).
+    pub fn run(
+        &mut self,
+        inputs: std::collections::HashMap<String, (Vec<f32>, Vec<u64>)>,
+    ) -> Result<std::collections::HashMap<String, (Vec<f32>, Vec<u64>)>, OnnxError> {
+        use rustnn::mlcontext::MLTensorDescriptor;
+        use rustnn::MLOperandDataType as DT;
+
+        // Create writable input tensors — use the declared type from graph descriptors.
+        let input_descs = self.graph.input_descriptors.clone();
+        let mut input_tensors: std::collections::HashMap<String, rustnn::mlcontext::MLTensor> =
+            std::collections::HashMap::new();
+        for (name, (data, shape)) in &inputs {
+            // Determine the declared data type for this input.
+            let dtype = input_descs.get(name.as_str())
+                .map(|d| {
+                    use rustnn::graph::DataType;
+                    match d.data_type {
+                        DataType::Int64  => DT::Int64,
+                        DataType::Int32  => DT::Int32,
+                        DataType::Uint8  => DT::Uint8,
+                        _                => DT::Float32,
+                    }
+                })
+                .unwrap_or(DT::Float32);
+
+            let mut desc = MLTensorDescriptor::new(dtype.clone(), shape.clone());
+            desc.set_writable(true);
+            let mut tensor = self
+                .context
+                .create_tensor(&desc)
+                .map_err(|e| OnnxError::ShapeInference(format!("create input tensor: {e}")))?;
+
+            // Write bytes with the correct element type.
+            let bytes: Vec<u8> = match dtype {
+                DT::Int64 => {
+                    let ints: Vec<i64> = data.iter().map(|&v| v as i64).collect();
+                    bytemuck::cast_slice::<i64, u8>(&ints).to_vec()
+                }
+                DT::Int32 => {
+                    let ints: Vec<i32> = data.iter().map(|&v| v as i32).collect();
+                    bytemuck::cast_slice::<i32, u8>(&ints).to_vec()
+                }
+                _ => bytemuck::cast_slice::<f32, u8>(data.as_slice()).to_vec(),
+            };
+            self.context
+                .write_tensor(&mut tensor, &bytes)
+                .map_err(|e| OnnxError::ShapeInference(format!("write tensor: {e}")))?;
+            input_tensors.insert(name.clone(), tensor);
+        }
+
+        // Determine output shapes from the graph's output_descriptors.
+        let output_descs = self.graph.output_descriptors.clone();
+        let mut output_tensors: std::collections::HashMap<String, rustnn::mlcontext::MLTensor> =
+            std::collections::HashMap::new();
+        for (name, op_desc) in &output_descs {
+            let shape: Vec<u64> = op_desc
+                .shape
+                .iter()
+                .map(|d| rustnn::graph::get_static_or_max_size(d) as u64)
+                .collect();
+            // Use Float32 — the parakeet output is f32.
+            let mut tdesc = MLTensorDescriptor::new(DT::Float32, shape);
+            tdesc.set_readable(true);
+            let tensor = self
+                .context
+                .create_tensor(&tdesc)
+                .map_err(|e| OnnxError::ShapeInference(format!("create output tensor: {e}")))?;
+            output_tensors.insert(name.clone(), tensor);
+        }
+
+        // dispatch() — the rustnn WebNN execution path, not raw ORT.
+        {
+            let input_refs: std::collections::HashMap<&str, &rustnn::mlcontext::MLTensor> =
+                input_tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
+            let output_refs: std::collections::HashMap<&str, &rustnn::mlcontext::MLTensor> =
+                output_tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
+            self.context
+                .dispatch(&mut self.graph, &input_refs, &output_refs)
+                .map_err(|e| OnnxError::ShapeInference(format!("dispatch failed: {e}")))?;
+        }
+
+        // Read back outputs via rustnn's read_tensor.
+        let mut results = std::collections::HashMap::new();
+        for (name, op_desc) in &output_descs {
+            let shape: Vec<u64> = op_desc
+                .shape
+                .iter()
+                .map(|d| rustnn::graph::get_static_or_max_size(d) as u64)
+                .collect();
+            let n_elems: usize = shape.iter().map(|&d| d as usize).product::<usize>().max(1);
+            let mut buf = vec![0f32; n_elems];
+            if let Some(tensor) = output_tensors.get(name) {
+                self.context
+                    .read_tensor(tensor, bytemuck::cast_slice_mut::<f32, u8>(buf.as_mut_slice()))
+                    .map_err(|e| OnnxError::ShapeInference(format!("read tensor: {e}")))?;
+            }
+            results.insert(name.clone(), (buf, shape));
+        }
+
+        Ok(results)
+    }
+}
+
 const MIN_SUPPORTED_OPSET: i64 = 11;
 const MAX_SUPPORTED_OPSET: i64 = 18;
 
