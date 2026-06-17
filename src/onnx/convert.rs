@@ -1107,6 +1107,48 @@ pub fn convert_onnx<P: AsRef<Path>>(
     let mut model: ModelProto =
         ModelProto::decode(&onnx_bytes[..]).map_err(|e| OnnxError::ProtobufError(e.to_string()))?;
 
+    // Load external weight data into initializers (ONNX external data format).
+    // data_location == 1 means EXTERNAL; external_data has key=location/offset/length.
+    // We cache each external file in memory (read once, slice many times).
+    if let Some(graph) = model.graph.as_mut() {
+        let model_dir = onnx_path_ref.parent().unwrap_or(std::path::Path::new("."));
+        let mut file_cache: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+        for initializer in graph.initializer.iter_mut() {
+            if initializer.data_location != 1 || !initializer.raw_data.is_empty() {
+                continue;
+            }
+            let mut location: Option<String> = None;
+            let mut offset: u64 = 0;
+            let mut length: Option<u64> = None;
+            for kv in &initializer.external_data {
+                match kv.key.as_str() {
+                    "location" => location = Some(kv.value.clone()),
+                    "offset" => offset = kv.value.parse().unwrap_or(0),
+                    "length" => length = kv.value.parse().ok(),
+                    _ => {}
+                }
+            }
+            if let Some(loc) = location {
+                let file_bytes = if let Some(cached) = file_cache.get(&loc) {
+                    cached
+                } else {
+                    let data_path = model_dir.join(&loc);
+                    let bytes = fs::read(&data_path).map_err(|e| {
+                        OnnxError::IoError(std::io::Error::new(
+                            e.kind(),
+                            format!("external data '{}': {e}", data_path.display()),
+                        ))
+                    })?;
+                    file_cache.entry(loc.clone()).or_insert(bytes)
+                };
+                let start = offset as usize;
+                let end = if let Some(len) = length { (offset + len) as usize } else { file_bytes.len() };
+                initializer.raw_data = file_bytes[start..end].to_vec();
+                initializer.data_location = 0;
+            }
+        }
+    }
+
     // Apply constant folding if optimize flag is set
     if options.optimize {
         crate::debug_println!("Running constant folding...");
