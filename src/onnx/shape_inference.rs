@@ -156,8 +156,17 @@ fn seed_initializers(
     for init in graph.initializer.as_slice() {
         let name = init.name.as_str().to_string();
 
-        let dtype = map_onnx_data_type(init.data_type)
-            .map_err(|_| ShapeInferenceError::UnsupportedDataType(init.data_type))?;
+        // Skip initializers with unsupported data types (e.g. fp16) — we still
+        // record their shape so downstream shape inference can proceed.
+        let dtype = match map_onnx_data_type(init.data_type) {
+            Ok(dt) => dt,
+            Err(_) => {
+                // Store shape-only for unsupported types (no type, no const values)
+                let shape: Vec<i64> = init.dims.as_slice().to_vec();
+                result.value_shapes.insert(name, shape);
+                continue;
+            }
+        };
         let shape: Vec<i64> = init.dims.as_slice().to_vec();
         result.value_types.insert(name.clone(), dtype.clone());
         result.value_shapes.insert(name.clone(), shape);
@@ -194,8 +203,15 @@ fn seed_constant_nodes(
                 .find(|a| a.name.as_str() == "value" && a.t.is_some())
             {
                 let t = attr.t.as_ref().unwrap();
-                let dtype = map_onnx_data_type(t.data_type)
-                    .map_err(|_| ShapeInferenceError::UnsupportedDataType(t.data_type))?;
+                let dtype = match map_onnx_data_type(t.data_type) {
+                    Ok(dt) => dt,
+                    Err(_) => {
+                        // Skip Constant nodes with unsupported types (e.g. fp16); record shape only.
+                        let shape: Vec<i64> = t.dims.as_slice().to_vec();
+                        result.value_shapes.insert(out_name, shape);
+                        continue;
+                    }
+                };
                 result.value_types.insert(out_name.clone(), dtype);
 
                 let vals = read_int_tensor(t);
@@ -279,7 +295,8 @@ pub fn infer_node_output_shape(
     match op {
         // Unary operations that preserve shape
         "Cast" | "Relu" | "Tanh" | "Sigmoid" | "Erf" | "Softmax" | "Gelu" | "Exp" | "Log"
-        | "Abs" | "Neg" | "Sqrt" | "LayerNormalization" | "Trilu" => {
+        | "Abs" | "Neg" | "Sqrt" | "Floor" | "Ceil" | "Round" | "Not"
+        | "LayerNormalization" | "Trilu" => {
             let ins = node.input.as_slice();
             if ins.is_empty() {
                 return None;
@@ -288,7 +305,7 @@ pub fn infer_node_output_shape(
         }
 
         // Binary operations with NumPy-style broadcasting semantics.
-        "Add" | "Sub" | "Mul" | "Div" | "Pow" => {
+        "Add" | "Sub" | "Mul" | "Div" | "Pow" | "And" | "Or" | "Xor" => {
             let ins = node.input.as_slice();
             if ins.len() < 2 {
                 return None;
@@ -366,7 +383,10 @@ pub fn infer_node_output_shape(
                 .map(|a| a.ints.iter().map(|&i| i as usize).collect::<Vec<usize>>())
                 .unwrap_or_else(|| (0..input_shape.len()).rev().collect());
 
-            // Apply permutation
+            // Apply permutation — return None if any index is out of bounds
+            if perm.iter().any(|&i| i >= input_shape.len()) {
+                return None;
+            }
             Some(perm.iter().map(|&i| input_shape[i]).collect())
         }
 
@@ -384,17 +404,24 @@ pub fn infer_node_output_shape(
                 .as_slice()
                 .iter()
                 .find(|a| a.name.as_str() == "keepdims")
-                .and_then(|a| if a.i != 0 { Some(a.i != 0) } else { None })
+                .map(|a| a.i != 0)
                 .unwrap_or(true);
 
-            // Get axes attribute
-            let axes: Vec<i64> = node
+            // Get axes — from attribute (opset ≤ 12) or second input (opset 13+).
+            let mut axes: Vec<i64> = node
                 .attribute
                 .as_slice()
                 .iter()
                 .find(|a| a.name.as_str() == "axes")
                 .map(|a| a.ints.clone())
                 .unwrap_or_default();
+            if axes.is_empty() && ins.len() >= 2 && !ins[1].is_empty() {
+                if let Some(vals) = const_values.get(ins[1].as_str()) {
+                    if !vals.is_empty() {
+                        axes = vals.iter().map(|&v| v).collect();
+                    }
+                }
+            }
 
             if axes.is_empty() {
                 // Reduce all dimensions
