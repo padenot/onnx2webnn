@@ -42,6 +42,9 @@ impl OpHandler for ActivationHandler {
                 | "Erf"
                 | "Cos"
                 | "Sin"
+                | "Floor"
+                | "Ceil"
+                | "Round"
                 | "Identity"
         )
     }
@@ -56,7 +59,9 @@ impl OpHandler for ActivationHandler {
         let node_name = if !node.name.is_empty() {
             node.name.as_str().to_string()
         } else {
-            "unnamed".to_string()
+            node.output.first()
+                .map(|s| crate::onnx::convert::sanitize_identifier(s))
+                .unwrap_or_else(|| node.op_type.to_string())
         };
 
         let webnn_op = match op_type {
@@ -72,6 +77,9 @@ impl OpHandler for ActivationHandler {
             "Erf" => "erf",
             "Cos" => "cos",
             "Sin" => "sin",
+            "Floor" => "floor",
+            "Ceil" => "ceil",
+            "Round" => "round",
             "Identity" => "identity",
             _ => {
                 return Err(OnnxError::UnsupportedOp {
@@ -146,6 +154,9 @@ fn emit_unary(
         "erf" => b.builder.erf_with_options(input, opts).map_err(map_op_error)?,
         "cos" => b.builder.cos_with_options(input, opts).map_err(map_op_error)?,
         "sin" => b.builder.sin_with_options(input, opts).map_err(map_op_error)?,
+        "floor" => b.builder.floor_with_options(input, opts).map_err(map_op_error)?,
+        "ceil" => b.builder.ceil_with_options(input, opts).map_err(map_op_error)?,
+        "round" => b.builder.round_even_with_options(input, opts).map_err(map_op_error)?,
         "identity" => b
             .builder
             .identity_with_options(input, opts)
