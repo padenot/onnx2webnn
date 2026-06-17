@@ -35,7 +35,9 @@ impl OpHandler for ReductionHandler {
         let node_name = if !node.name.is_empty() {
             node.name.clone()
         } else {
-            "unnamed".to_string()
+            node.output.first()
+                .map(|s| crate::onnx::convert::sanitize_identifier(s))
+                .unwrap_or_else(|| node.op_type.to_string())
         };
 
         match op_type {
@@ -85,8 +87,17 @@ impl ReductionHandler {
         for attr in node.attribute.as_slice() {
             match attr.name.as_str() {
                 "axes" if !attr.ints.is_empty() => axes = Some(attr.ints.clone()),
-                "keepdims" if attr.i != 0 => keepdims = attr.i,
+                "keepdims" => keepdims = attr.i,
+                "noop_with_empty_axes" => {} // handled below
                 _ => {}
+            }
+        }
+        // ONNX opset 13: axes may be provided as a second input tensor (not an attribute).
+        if axes.is_none() && inputs.len() >= 2 && !inputs[1].is_empty() {
+            if let Some(vals) = context.const_values.get(inputs[1].as_str()) {
+                if !vals.is_empty() {
+                    axes = Some(vals.iter().map(|&v| v).collect());
+                }
             }
         }
 
