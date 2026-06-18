@@ -79,7 +79,7 @@ impl OpHandler for ConvHandler {
 }
 
 #[derive(Debug, Clone)]
-struct ConvAttrs {
+pub(super) struct ConvAttrs {
     auto_pad: String,
     dilations: Option<Vec<i64>>,
     group: i64,
@@ -90,7 +90,7 @@ struct ConvAttrs {
     output_shape: Option<Vec<i64>>,
 }
 
-fn parse_conv_attrs(node: &NodeProto) -> ConvAttrs {
+pub(super) fn parse_conv_attrs(node: &NodeProto) -> ConvAttrs {
     let mut attrs = ConvAttrs {
         auto_pad: "NOTSET".to_string(),
         dilations: None,
@@ -176,10 +176,15 @@ fn i64_vec_to_u32(values: &[i64]) -> Result<Vec<u32>, OnnxError> {
         .collect()
 }
 
-fn build_conv2d_options(attrs: &ConvAttrs, label: &str) -> Result<MLConv2dOptions, OnnxError> {
-    let strides = attrs.strides.clone().unwrap_or_else(|| vec![1, 1]);
-    let dilations = attrs.dilations.clone().unwrap_or_else(|| vec![1, 1]);
-    let pads = attrs.pads.clone().unwrap_or_else(|| vec![0, 0, 0, 0]);
+pub(super) fn build_conv2d_options(attrs: &ConvAttrs, label: &str) -> Result<MLConv2dOptions, OnnxError> {
+    // Extend 1D attrs to 2D by appending 1 (treats the second spatial dim as size-1).
+    let extend2 = |v: Vec<i64>| if v.len() == 1 { vec![v[0], 1] } else { v };
+    let strides = extend2(attrs.strides.clone().unwrap_or_else(|| vec![1, 1]));
+    let dilations = extend2(attrs.dilations.clone().unwrap_or_else(|| vec![1, 1]));
+    let pads = {
+        let p = attrs.pads.clone().unwrap_or_else(|| vec![0, 0, 0, 0]);
+        if p.len() == 2 { vec![p[0], 0, p[1], 0] } else { p }
+    };
 
     if strides.len() != 2 {
         return Err(OnnxError::InvalidShape(format!(
