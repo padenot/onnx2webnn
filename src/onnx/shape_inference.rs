@@ -304,6 +304,13 @@ pub fn infer_node_output_shape(
             value_shapes.get(ins[0].as_str()).cloned()
         }
 
+        // QuantizeLinear / DequantizeLinear: output shape = input shape.
+        "QuantizeLinear" | "DequantizeLinear" => {
+            let ins = node.input.as_slice();
+            if ins.is_empty() { return None; }
+            value_shapes.get(ins[0].as_str()).cloned()
+        }
+
         // Binary operations with NumPy-style broadcasting semantics.
         "Add" | "Sub" | "Mul" | "Div" | "Pow" | "And" | "Or" | "Xor" => {
             let ins = node.input.as_slice();

@@ -23,7 +23,10 @@ pub struct QuantizationHandler;
 
 impl OpHandler for QuantizationHandler {
     fn supports(&self, op_type: &str) -> bool {
-        matches!(op_type, "DynamicQuantizeLinear" | "ConvInteger" | "MatMulInteger")
+        matches!(op_type,
+            "DynamicQuantizeLinear" | "ConvInteger" | "MatMulInteger"
+            | "QuantizeLinear" | "DequantizeLinear"
+        )
     }
 
     fn convert(
@@ -36,6 +39,8 @@ impl OpHandler for QuantizationHandler {
             "DynamicQuantizeLinear" => convert_dynamic_quantize_linear(node, context, b),
             "ConvInteger"           => convert_conv_integer(node, context, b),
             "MatMulInteger"         => convert_matmul_integer(node, b),
+            "QuantizeLinear"        => convert_quantize_linear(node, b),
+            "DequantizeLinear"      => convert_dequantize_linear(node, b),
             _ => unreachable!(),
         }
     }
@@ -221,6 +226,83 @@ fn convert_matmul_integer(
     let mut result = ConversionResult::default();
     if let Some(out_name) = node.output.first() {
         result.output_types.insert(out_name.to_string(), DataType::Int32);
+    }
+    Ok(result)
+}
+
+// QuantizeLinear: static-scale quantization. In the QDQ model these wrap
+// each op with fixed scale/zero_point computed during calibration.
+// ONNX: QuantizeLinear(x, y_scale, y_zero_point?) → y (int8/uint8)
+// WebNN: quantizeLinear(x, scale, zero_point) — direct 1:1 mapping.
+fn convert_quantize_linear(
+    node: &NodeProto,
+    b: &mut OnnxBuilder<'_, '_, '_>,
+) -> Result<ConversionResult, OnnxError> {
+    let inputs = node.input.as_slice();
+    if inputs.len() < 2 {
+        return Err(OnnxError::InvalidShape("QuantizeLinear: need ≥ 2 inputs".into()));
+    }
+    let node_name = node.output.first()
+        .map(|s| crate::onnx::convert::sanitize_identifier(s))
+        .unwrap_or_else(|| "quantize_linear".to_string());
+
+    let x     = b.resolve_operand(&inputs[0])?;
+    let scale = b.resolve_operand(&inputs[1])?;
+    let output_label = crate::onnx::convert::sanitize_identifier(
+        node.output.first().map(|s| s.as_str()).unwrap_or(&node_name)
+    );
+
+    let out = if inputs.len() >= 3 && !inputs[2].is_empty() {
+        let zp = b.resolve_operand(&inputs[2])?;
+        let opts = labeled_opts(&output_label);
+        b.builder.quantize_linear_with_zeropoint(x, scale, zp).map_err(map_op_error)?
+    } else {
+        let opts = labeled_opts(&output_label);
+        b.builder.quantize_linear_with_options(x, scale, None, opts).map_err(map_op_error)?
+    };
+
+    if let Some(onnx_out) = node.output.first() {
+        crate::onnx::builder_helpers::record_node_output(b, onnx_out, &output_label, out);
+    }
+    // Output dtype = zero_point dtype (uint8 or int8); let the converter infer it.
+    Ok(ConversionResult::default())
+}
+
+// DequantizeLinear: static-scale dequantization.
+// ONNX: DequantizeLinear(x, x_scale, x_zero_point?) → y (float32)
+// WebNN: dequantizeLinear(x, scale, zero_point) — direct 1:1 mapping.
+fn convert_dequantize_linear(
+    node: &NodeProto,
+    b: &mut OnnxBuilder<'_, '_, '_>,
+) -> Result<ConversionResult, OnnxError> {
+    let inputs = node.input.as_slice();
+    if inputs.len() < 2 {
+        return Err(OnnxError::InvalidShape("DequantizeLinear: need ≥ 2 inputs".into()));
+    }
+    let node_name = node.output.first()
+        .map(|s| crate::onnx::convert::sanitize_identifier(s))
+        .unwrap_or_else(|| "dequantize_linear".to_string());
+
+    let x     = b.resolve_operand(&inputs[0])?;
+    let scale = b.resolve_operand(&inputs[1])?;
+    let output_label = crate::onnx::convert::sanitize_identifier(
+        node.output.first().map(|s| s.as_str()).unwrap_or(&node_name)
+    );
+
+    let out = if inputs.len() >= 3 && !inputs[2].is_empty() {
+        let zp = b.resolve_operand(&inputs[2])?;
+        b.builder.dequantize_linear_with_zeropoint(x, scale, zp).map_err(map_op_error)?
+    } else {
+        let opts = labeled_opts(&output_label);
+        b.builder.dequantize_linear_with_options(x, scale, None, opts).map_err(map_op_error)?
+    };
+
+    if let Some(onnx_out) = node.output.first() {
+        crate::onnx::builder_helpers::record_node_output(b, onnx_out, &output_label, out);
+    }
+    let mut result = ConversionResult::default();
+    if let Some(out_name) = node.output.first() {
+        result.output_types.insert(out_name.to_string(), DataType::Float32);
     }
     Ok(result)
 }
