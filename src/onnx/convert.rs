@@ -230,6 +230,8 @@ pub struct ConvertOptions {
     pub optimize: bool,
     /// Experimental: preserve unresolved dynamic input dimensions in graph metadata
     pub experimental_dynamic_inputs: bool,
+    /// Request GPU acceleration (CUDA EP when available, falls back to CPU)
+    pub accelerated: bool,
 }
 
 impl Default for ConvertOptions {
@@ -238,6 +240,7 @@ impl Default for ConvertOptions {
             free_dim_overrides: HashMap::new(),
             optimize: false,
             experimental_dynamic_inputs: false,
+            accelerated: false,
         }
     }
 }
@@ -1196,7 +1199,7 @@ pub(crate) fn convert_model(
 
     let mut context = MLContext::create(&MLContextOptions::new(
         MLPowerPreference::Default,
-        false,
+        options.accelerated,
     ))
     .map_err(|e| OnnxError::ShapeInference(format!("MLContext::create failed: {e}")))?;
 

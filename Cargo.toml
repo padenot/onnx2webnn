@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "onnx2webnn"
 path = "src/main.rs"
 
+[[bin]]
+name = "parakeet_infer"
+path = "src/parakeet_infer.rs"
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
@@ -25,6 +29,11 @@ thiserror = "1.0"
 rustnn = { path = "../rustnn", default-features = false, features = ["onnx-runtime"] }
 bytemuck = "1.15"
 webnn-onnx-utils = { git = "https://github.com/rustnn/webnn-onnx-utils", branch = "main" }
+
+hound = "3.5"
+ndarray = "0.17"
+realfft = "3"
+tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
 
 [dev-dependencies]
 tempfile = "3.8"
