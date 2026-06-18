@@ -254,6 +254,19 @@ pub fn tensor_proto_to_bytes(tensor: &TensorProto) -> Result<Vec<u8>, OnnxError>
             .collect());
     }
     if !tensor.int32_data.is_empty() {
+        // ONNX stores int8/uint8 values in int32_data (one i32 per element, low byte only).
+        // Detect by data_type and truncate to 1 byte per element.
+        use crate::protos::onnx::TensorProto_DataType;
+        let dt = tensor.data_type;
+        if dt == TensorProto_DataType::Int8 as i32 {
+            return Ok(tensor.int32_data.iter().map(|&v| v as i8 as u8).collect());
+        }
+        if dt == TensorProto_DataType::Uint8 as i32 {
+            return Ok(tensor.int32_data.iter().map(|&v| v as u8).collect());
+        }
+        if dt == TensorProto_DataType::Bool as i32 {
+            return Ok(tensor.int32_data.iter().map(|&v| v as u8).collect());
+        }
         return Ok(tensor
             .int32_data
             .iter()
