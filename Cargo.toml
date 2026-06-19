@@ -29,6 +29,7 @@ thiserror = "1.0"
 rustnn = { path = "../rustnn", default-features = false, features = ["onnx-runtime"] }
 bytemuck = "1.15"
 webnn-onnx-utils = { git = "https://github.com/rustnn/webnn-onnx-utils", branch = "main" }
+webnn-graph = { path = "../webnn-graph-local" }
 
 hound = "3.5"
 ndarray = "0.17"

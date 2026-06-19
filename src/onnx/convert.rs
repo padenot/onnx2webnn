@@ -1189,6 +1189,142 @@ pub fn convert_onnx<P: AsRef<Path>>(
     convert_model(model, &options)
 }
 
+/// Convert ONNX to WebNN graph files without building a backend session.
+///
+/// Produces `output_webnn` (text DSL), `output_weights` (raw binary), and
+/// `output_manifest` (JSON manifest). These are loaded at runtime via
+/// `rustnn::load_graph_from_path()` + `MLGraphBuilder::build_graph_info()`.
+pub fn convert_onnx_save_webnn<P: AsRef<Path>>(
+    onnx_path: P,
+    mut options: ConvertOptions,
+    output_webnn: &str,
+    output_weights: &str,
+    output_manifest: &str,
+) -> Result<(), OnnxError> {
+    use rustnn::webnn_json::to_graph_json;
+    use webnn_graph::serialize::{serialize_graph_to_wg_text as _wg_text_unused, SerializeOptions as _};
+    use webnn_graph::weights_io::extract_weights;
+
+    let onnx_path_ref = onnx_path.as_ref();
+    let onnx_bytes = fs::read(onnx_path_ref)?;
+    let mut model: ModelProto =
+        ModelProto::decode(&onnx_bytes[..]).map_err(|e| OnnxError::ProtobufError(e.to_string()))?;
+
+    // Load external weights (same as convert_onnx)
+    if let Some(graph) = model.graph.as_mut() {
+        let model_dir = onnx_path_ref.parent().unwrap_or(Path::new("."));
+        let mut file_cache: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+        for initializer in graph.initializer.iter_mut() {
+            if initializer.data_location != 1 || !initializer.raw_data.is_empty() {
+                continue;
+            }
+            let mut location: Option<String> = None;
+            let mut offset: u64 = 0;
+            let mut length: Option<u64> = None;
+            for kv in &initializer.external_data {
+                match kv.key.as_str() {
+                    "location" => location = Some(kv.value.clone()),
+                    "offset" => offset = kv.value.parse().unwrap_or(0),
+                    "length" => length = kv.value.parse().ok(),
+                    _ => {}
+                }
+            }
+            if let Some(loc) = location {
+                let file_bytes = if let Some(cached) = file_cache.get(&loc) {
+                    cached
+                } else {
+                    let data_path = model_dir.join(&loc);
+                    let bytes = fs::read(&data_path).map_err(|e| {
+                        OnnxError::IoError(std::io::Error::new(e.kind(),
+                            format!("external data '{}': {e}", data_path.display())))
+                    })?;
+                    file_cache.entry(loc.clone()).or_insert(bytes)
+                };
+                let start = offset as usize;
+                let end = if let Some(len) = length { (offset + len) as usize } else { file_bytes.len() };
+                initializer.raw_data = file_bytes[start..end].to_vec();
+                initializer.data_location = 0;
+            }
+        }
+    }
+
+    // Apply sidecar dim overrides
+    if options.free_dim_overrides.is_empty() {
+        let mut sidecar = onnx_path_ref.to_path_buf();
+        sidecar.set_extension("dims.json");
+        if sidecar.exists() {
+            let content = fs::read_to_string(&sidecar)?;
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(obj) = json.get("freeDimensionOverrides").unwrap_or(&json).as_object() {
+                    for (name, value) in obj {
+                        if let Some(v) = value.as_u64() {
+                            options.free_dim_overrides.entry(name.clone()).or_insert(v as u32);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Convert to WebNN GraphInfo without building ORT
+    let graph_info = extract_graph_info_from_model(model, &options)?;
+
+    // Serialize to webnn-graph JSON, then extract weights + write text
+    let graph_json = to_graph_json(&graph_info, false)
+        .map_err(|e| OnnxError::ShapeInference(format!("to_graph_json: {e}")))?;
+
+    // Extract inline weight bytes to .weights + .manifest.json, get updated graph with @weights() refs
+    let output_dir = Path::new(output_weights).parent().unwrap_or(Path::new("."));
+    let graph_json_with_refs = extract_weights(
+        &graph_json,
+        output_dir.to_str().unwrap_or("."),
+        output_weights,
+        output_manifest,
+    ).map_err(|e| OnnxError::ShapeInference(format!("extract_weights: {e}")))?;
+
+    // Write as JSON (preserves intermediate_shapes for lossless round-trip).
+    // The .webnn text format doesn't support intermediate_shapes.
+    let json = serde_json::to_string_pretty(&graph_json_with_refs)
+        .map_err(|e| OnnxError::ShapeInference(format!("json serialize: {e}")))?;
+    fs::write(output_webnn, json)
+        .map_err(|e| OnnxError::IoError(std::io::Error::new(e.kind(), format!("write webnn: {e}"))))?;
+
+    Ok(())
+}
+
+/// Build WebNN GraphInfo from a parsed ModelProto without constructing an ORT session.
+fn extract_graph_info_from_model(
+    model: ModelProto,
+    options: &ConvertOptions,
+) -> Result<rustnn::GraphInfo, OnnxError> {
+    let converter = OnnxConverter::new(model.clone())?;
+    converter.extract_metadata()?;
+
+    let mut context = MLContext::create(&MLContextOptions::new(
+        MLPowerPreference::Default,
+        false,
+    )).map_err(|e| OnnxError::ShapeInference(format!("MLContext::create failed: {e}")))?;
+
+    let mut ml_builder = MLGraphBuilder::new(&mut context).map_err(map_rustnn_error)?;
+    let mut onnx_builder = OnnxBuilder::new(&mut ml_builder);
+
+    converter.convert_with_builder(&mut onnx_builder, options)?;
+
+    let onnx_graph = model.graph.as_ref()
+        .ok_or_else(|| OnnxError::ProtobufError("Missing graph".to_string()))?;
+
+    let mut outputs: HashMap<String, MLOperand> = HashMap::new();
+    for output in onnx_graph.output.as_slice() {
+        let op = onnx_builder.output_operand(output.name.as_str())?;
+        let key = onnx_builder.build_output_key(output.name.as_str());
+        outputs.insert(key, op);
+    }
+    let output_refs: HashMap<&str, MLOperand> =
+        outputs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+
+    ml_builder.finalize_to_graph_info(&output_refs).map_err(map_rustnn_error)
+}
+
 /// Lower ONNX to [`MLGraphBuilder`] and validate with ORT `build()`.
 pub(crate) fn convert_model(
     model: ModelProto,
