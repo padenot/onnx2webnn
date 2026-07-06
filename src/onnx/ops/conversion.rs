@@ -6,9 +6,11 @@
 
 // Type conversion and constant operators: Cast, Constant
 
-use crate::onnx::builder::{map_onnx_tensor_type, map_op_error, tensor_proto_to_bytes, OnnxBuilder};
+use crate::onnx::builder::{
+    map_onnx_tensor_type, map_op_error, tensor_proto_to_bytes, OnnxBuilder,
+};
 use crate::onnx::builder_helpers::{output_label, record_node_output};
-use crate::onnx::convert::OnnxError;
+use crate::onnx::convert::{sanitize_identifier, OnnxError};
 use crate::onnx::ops::{ConversionContext, ConversionResult, OpHandler};
 use crate::protos::onnx::NodeProto;
 
@@ -22,20 +24,21 @@ impl OpHandler for ConversionHandler {
     fn convert(
         &self,
         node: &NodeProto,
-        _context: &ConversionContext,
+        context: &ConversionContext,
         b: &mut OnnxBuilder<'_, '_, '_>,
     ) -> Result<ConversionResult, OnnxError> {
         let op_type = node.op_type.as_str();
         let node_name = if !node.name.is_empty() {
             node.name.clone()
         } else {
-            node.output.first()
+            node.output
+                .first()
                 .map(|s| crate::onnx::convert::sanitize_identifier(s))
                 .unwrap_or_else(|| node.op_type.to_string())
         };
 
         match op_type {
-            "Cast" => self.convert_cast(node, &node_name, b),
+            "Cast" => self.convert_cast(node, &node_name, context, b),
             "Constant" => self.convert_constant(node, &node_name, b),
             _ => Err(OnnxError::UnsupportedOp {
                 op: op_type.to_string(),
@@ -50,6 +53,7 @@ impl ConversionHandler {
         &self,
         node: &NodeProto,
         node_name: &str,
+        context: &ConversionContext,
         b: &mut OnnxBuilder<'_, '_, '_>,
     ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.input.as_slice();
@@ -75,6 +79,65 @@ impl ConversionHandler {
 
         let output_name = output_label(node, node_name);
         let input = b.resolve_operand(&inputs[0])?;
+        let target_data_type = crate::onnx::convert::map_onnx_data_type(to_type.unwrap() as i32)?;
+        if matches!(
+            target_data_type,
+            rustnn::DataType::Int64 | rustnn::DataType::Int32
+        ) {
+            if let Some(values) = context
+                .const_values
+                .get(inputs[0].as_str())
+                .or_else(|| context.const_values.get(&sanitize_identifier(&inputs[0])))
+            {
+                let output_shape = context
+                    .resolve_shape(inputs[0].as_str())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        if values.len() == 1 {
+                            Vec::new()
+                        } else {
+                            vec![values.len() as i64]
+                        }
+                    });
+                let output_shape_u32: Vec<u32> =
+                    output_shape.iter().map(|&d| d.max(0) as u32).collect();
+                let bytes: Vec<u8> = match target_data_type {
+                    rustnn::DataType::Int64 => {
+                        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+                    }
+                    rustnn::DataType::Int32 => values
+                        .iter()
+                        .flat_map(|v| (*v as i32).to_le_bytes())
+                        .collect(),
+                    _ => unreachable!(),
+                };
+                b.register_constant_from_bytes(
+                    &output_name,
+                    target_data_type,
+                    &output_shape_u32,
+                    &bytes,
+                )?;
+                let out = b.resolve_operand(&output_name)?;
+                if let Some(onnx_out) = node.output.first() {
+                    record_node_output(b, onnx_out, &output_name, out);
+                } else {
+                    b.record_operand(&[&output_name], out);
+                }
+                let mut result = ConversionResult::default();
+                if let Some(onnx_out) = node.output.first() {
+                    result
+                        .output_types
+                        .insert(onnx_out.to_string(), target_data_type);
+                    result
+                        .output_shapes
+                        .insert(onnx_out.to_string(), output_shape);
+                    result
+                        .const_values
+                        .insert(onnx_out.to_string(), values.clone());
+                }
+                return Ok(result);
+            }
+        }
         let target_type = map_onnx_tensor_type(to_type.unwrap() as i32)?;
         let opts = OnnxBuilder::labeled_options(&output_name);
         let out = b
@@ -112,11 +175,7 @@ impl ConversionHandler {
             })?;
 
         let data_type = crate::onnx::convert::map_onnx_data_type(tensor.data_type)?;
-        let shape: Vec<u32> = tensor
-            .dims
-            .iter()
-            .map(|&d| d.max(0) as u32)
-            .collect();
+        let shape: Vec<u32> = tensor.dims.iter().map(|&d| d.max(0) as u32).collect();
         let bytes = tensor_proto_to_bytes(tensor)?;
         b.register_constant_from_bytes(onnx_out, data_type, &shape, &bytes)?;
         Ok(ConversionResult::default())

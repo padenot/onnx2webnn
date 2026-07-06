@@ -18,7 +18,6 @@
 
 // Utility operators: Shape, Gather, Slice
 
-use rustnn::DataType;
 use crate::onnx::builder::{map_op_error, OnnxBuilder};
 use crate::onnx::builder_helpers::{
     ast_dims_to_mldim, expand_with_shape, i64_starts_as_u32, output_label, record_node_output,
@@ -29,7 +28,10 @@ use crate::onnx::ops::{
     normalize_axis_best_effort, ConversionContext, ConversionResult, OpHandler,
 };
 use crate::protos::onnx::NodeProto;
-use rustnn::operator_options::{MLDimension, MLDynamicDimension, MLGatherOptions, MLTriangularOptions};
+use rustnn::operator_options::{
+    MLDimension, MLDynamicDimension, MLGatherOptions, MLTriangularOptions,
+};
+use rustnn::DataType;
 
 pub struct UtilityHandler;
 
@@ -51,13 +53,14 @@ impl OpHandler for UtilityHandler {
         let node_name = if !node.name.is_empty() {
             node.name.as_str().to_string()
         } else {
-            node.output.first()
+            node.output
+                .first()
                 .map(|s| crate::onnx::convert::sanitize_identifier(s))
                 .unwrap_or_else(|| node.op_type.to_string())
         };
 
         match op_type {
-            "Shape" => self.convert_shape(node, &node_name, b),
+            "Shape" => self.convert_shape(node, &node_name, context, b),
             "Gather" => self.convert_gather(node, &node_name, context, b),
             "Slice" => self.convert_slice(node, &node_name, context, b),
             "ConstantOfShape" => self.convert_constant_of_shape(node, &node_name, context, b),
@@ -78,6 +81,7 @@ impl UtilityHandler {
         &self,
         node: &NodeProto,
         node_name: &str,
+        context: &ConversionContext,
         b: &mut OnnxBuilder<'_, '_, '_>,
     ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.input.as_slice();
@@ -90,6 +94,39 @@ impl UtilityHandler {
 
         let output_name = output_label(node, node_name);
         let input = b.resolve_operand(&inputs[0])?;
+        if let Some(shape) = context
+            .resolve_shape(inputs[0].as_str())
+            .cloned()
+            .or_else(|| {
+                b.builder
+                    .rustnn_operand_shape(input)
+                    .ok()
+                    .map(|s| s.iter().map(|&d| d as i64).collect())
+            })
+        {
+            let bytes: Vec<u8> = shape.iter().flat_map(|v| v.to_le_bytes()).collect();
+            b.register_constant_from_bytes(
+                &output_name,
+                DataType::Int64,
+                &[shape.len() as u32],
+                &bytes,
+            )?;
+            let out = b.resolve_operand(&output_name)?;
+            if let Some(output) = node.output.as_slice().first() {
+                record_node_output(b, output, &output_name, out);
+            }
+            let mut result = ConversionResult::default();
+            if let Some(output) = node.output.as_slice().first() {
+                result
+                    .output_types
+                    .insert(output.to_string(), DataType::Int64);
+                result
+                    .output_shapes
+                    .insert(output.to_string(), vec![shape.len() as i64]);
+                result.const_values.insert(output.to_string(), shape);
+            }
+            return Ok(result);
+        }
         let opts = OnnxBuilder::labeled_options(&output_name);
         let out = b
             .builder
@@ -154,81 +191,77 @@ impl UtilityHandler {
             &inputs[0],
             context.value_shape_dims,
         );
-        if let (Some(start), Some(delta), Some(limit_dim)) = (
-            start,
-            delta,
-            crate::onnx::shape_inference::dynamic_scalar_dimension_for_value(
-                &inputs[1],
-                context.value_shape_dims,
-            ),
-        ) {
-            let range_dim = crate::onnx::shape_inference::dynamic_range_length_dimension(
+        let limit_dim_opt = crate::onnx::shape_inference::dynamic_scalar_dimension_for_value(
+            &inputs[1],
+            context.value_shape_dims,
+        );
+        if let (Some(start), Some(delta), Some(limit_dim)) = (start, delta, limit_dim_opt) {
+            let range_dim_opt = crate::onnx::shape_inference::dynamic_range_length_dimension(
                 start,
                 delta,
                 start_dim.as_ref(),
                 &limit_dim,
-            )
-            .ok_or_else(|| {
-                OnnxError::InvalidShape(format!(
-                    "Range {} requires dynamic range length to be representable as <dim> +/- const with delta=1",
-                    node_name,
-                ))
-            })?;
+            );
+            if let Some(range_dim) = range_dim_opt {
+                let max_len = usize::try_from(range_dim.max_size).map_err(|_| {
+                    OnnxError::InvalidShape(format!(
+                        "Range {} max size {} does not fit in usize",
+                        node_name, range_dim.max_size
+                    ))
+                })?;
 
-            let max_len = usize::try_from(range_dim.max_size).map_err(|_| {
-                OnnxError::InvalidShape(format!(
-                    "Range {} max size {} does not fit in usize",
-                    node_name, range_dim.max_size
-                ))
-            })?;
+                let use_runtime_start = start_dim.is_some();
+                let mut values = Vec::with_capacity(max_len.max(1));
+                let mut current = if use_runtime_start { 0 } else { start };
+                for _ in 0..max_len {
+                    values.push(current);
+                    current += delta;
+                }
+                if values.is_empty() {
+                    values.push(if use_runtime_start { 0 } else { start });
+                }
 
-            let use_runtime_start = start_dim.is_some();
-            let mut values = Vec::with_capacity(max_len.max(1));
-            let mut current = if use_runtime_start { 0 } else { start };
-            for _ in 0..max_len {
-                values.push(current);
-                current += delta;
+                let bytes: Vec<u8> = values
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes().to_vec())
+                    .collect();
+
+                let range_const_name = format!("{}_range_const", output_name);
+                b.register_constant_from_bytes(
+                    &range_const_name,
+                    DataType::Int64,
+                    &[values.len() as u32],
+                    &bytes,
+                )?;
+
+                let range_const = b.resolve_operand(&range_const_name)?;
+                let slice_sizes = vec![MLDimension::Dynamic(MLDynamicDimension {
+                    name: range_dim.name.clone(),
+                    max_size: range_dim.max_size,
+                })];
+                let sliced = slice_with_params(b, range_const, &output_name, &[0], &slice_sizes)?;
+                let out = if use_runtime_start {
+                    let start_op = b.resolve_operand(&inputs[0])?;
+                    let opts = OnnxBuilder::labeled_options(&output_name);
+                    b.builder
+                        .add_with_options(sliced, start_op, opts)
+                        .map_err(map_op_error)?
+                } else {
+                    sliced
+                };
+                if let Some(out_name) = node.output.as_slice().first() {
+                    record_node_output(b, out_name, &output_name, out);
+                }
+                let mut result = ConversionResult::default();
+                if let Some(out) = node.output.as_slice().first() {
+                    result.output_types.insert(out.to_string(), DataType::Int64);
+                    result
+                        .output_shapes
+                        .insert(out.to_string(), vec![values.len() as i64]);
+                }
+                return Ok(result);
             }
-            if values.is_empty() {
-                values.push(if use_runtime_start { 0 } else { start });
-            }
-
-            let bytes: Vec<u8> = values
-                .iter()
-                .flat_map(|v| v.to_le_bytes().to_vec())
-                .collect();
-
-            let range_const_name = format!("{}_range_const", output_name);
-            b.register_constant_from_bytes(
-                &range_const_name,
-                DataType::Int64,
-                &[values.len() as u32],
-                &bytes,
-            )?;
-
-            let range_const = b.resolve_operand(&range_const_name)?;
-            let slice_sizes = vec![MLDimension::Dynamic(MLDynamicDimension {
-                name: range_dim.name.clone(),
-                max_size: range_dim.max_size,
-            })];
-            let sliced = slice_with_params(b, range_const, &output_name, &[0], &slice_sizes)?;
-            let out = if use_runtime_start {
-                let start_op = b.resolve_operand(&inputs[0])?;
-                let opts = OnnxBuilder::labeled_options(&output_name);
-                b.builder
-                    .add_with_options(sliced, start_op, opts)
-                    .map_err(map_op_error)?
-            } else {
-                sliced
-            };
-            if let Some(out_name) = node.output.as_slice().first() {
-                record_node_output(b, out_name, &output_name, out);
-            }
-            let mut result = ConversionResult::default();
-            if let Some(out) = node.output.as_slice().first() {
-                result.output_types.insert(out.to_string(), DataType::Int64);
-            }
-            return Ok(result);
+            // dynamic_range_length_dimension failed — fall through to static path
         }
 
         let start = start.ok_or_else(|| {
@@ -291,6 +324,10 @@ impl UtilityHandler {
         let mut result = ConversionResult::default();
         if let Some(out) = node.output.as_slice().first() {
             result.output_types.insert(out.to_string(), DataType::Int64);
+            result
+                .output_shapes
+                .insert(out.to_string(), vec![values.len() as i64]);
+            result.const_values.insert(out.to_string(), values);
         }
 
         Ok(result)
@@ -451,6 +488,18 @@ impl UtilityHandler {
                                 ]);
                             }
                         }
+                        x if x == crate::protos::onnx::TensorProto_DataType::Bool as i32 => {
+                            dtype = DataType::Uint8;
+                            if let Some(&value) = t.raw_data.as_slice().first() {
+                                fill_value_i64 = i64::from(value != 0);
+                            } else if let Some(&value) = t.int32_data.as_slice().first() {
+                                fill_value_i64 = i64::from(value != 0);
+                            } else if let Some(&value) = t.int64_data.as_slice().first() {
+                                fill_value_i64 = i64::from(value != 0);
+                            } else {
+                                fill_value_i64 = 0;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -466,15 +515,11 @@ impl UtilityHandler {
                     let f = f32::from_bits(fill_value_i64 as u32);
                     f.to_le_bytes().to_vec()
                 }
+                DataType::Uint8 => vec![fill_value_i64 as u8],
                 _ => fill_value_i64.to_le_bytes().to_vec(),
             };
             let scalar_name = format!("{}_fill", output_name);
-            b.register_constant_from_bytes(
-                &scalar_name,
-                dtype.clone(),
-                &[1],
-                &scalar_bytes,
-            )?;
+            b.register_constant_from_bytes(&scalar_name, dtype.clone(), &[1], &scalar_bytes)?;
 
             let scalar = b.resolve_operand(&scalar_name)?;
             let out = expand_with_shape(b, scalar, &output_name, ast_dims_to_mldim(dims))?;
@@ -507,6 +552,7 @@ impl UtilityHandler {
                 let val = f.to_le_bytes();
                 val.repeat(numel)
             }
+            DataType::Uint8 => vec![fill_value_i64 as u8; numel],
             _ => {
                 let val = fill_value_i64.to_le_bytes();
                 val.repeat(numel)
@@ -561,6 +607,75 @@ impl UtilityHandler {
         } else {
             axis
         };
+        if axis == 0 {
+            if let (Some(data), Some(indices)) = (
+                context.const_values.get(inputs[0].as_str()).or_else(|| {
+                    context
+                        .const_values
+                        .get(&sanitize_identifier(inputs[0].as_str()))
+                }),
+                context.const_values.get(inputs[1].as_str()).or_else(|| {
+                    context
+                        .const_values
+                        .get(&sanitize_identifier(inputs[1].as_str()))
+                }),
+            ) {
+                let mut gathered = Vec::with_capacity(indices.len());
+                let mut can_fold = true;
+                for &index in indices {
+                    let normalized = if index < 0 {
+                        index + data.len() as i64
+                    } else {
+                        index
+                    };
+                    let Ok(idx) = usize::try_from(normalized) else {
+                        can_fold = false;
+                        break;
+                    };
+                    let Some(value) = data.get(idx) else {
+                        can_fold = false;
+                        break;
+                    };
+                    gathered.push(*value);
+                }
+                if can_fold {
+                    let output_shape = context
+                        .resolve_shape(inputs[1].as_str())
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            if gathered.len() == 1 {
+                                Vec::new()
+                            } else {
+                                vec![gathered.len() as i64]
+                            }
+                        });
+                    let output_shape_u32: Vec<u32> =
+                        output_shape.iter().map(|&d| d.max(0) as u32).collect();
+                    let bytes: Vec<u8> = gathered.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    b.register_constant_from_bytes(
+                        &output_name,
+                        DataType::Int64,
+                        &output_shape_u32,
+                        &bytes,
+                    )?;
+                    let out = b.resolve_operand(&output_name)?;
+                    if let Some(output) = node.output.as_slice().first() {
+                        record_node_output(b, output, &output_name, out);
+                    }
+                    let mut result = ConversionResult::default();
+                    if let Some(output) = node.output.as_slice().first() {
+                        result
+                            .output_types
+                            .insert(output.to_string(), DataType::Int64);
+                        result
+                            .output_shapes
+                            .insert(output.to_string(), output_shape);
+                        result.const_values.insert(output.to_string(), gathered);
+                    }
+                    return Ok(result);
+                }
+            }
+        }
         let data = b.resolve_operand(&inputs[0])?;
         let indices = b.resolve_operand(&inputs[1])?;
         let opts = MLGatherOptions {
@@ -604,12 +719,25 @@ impl UtilityHandler {
 
         let output_name = output_label(node, node_name);
         let mut slice_params: Option<(Vec<u32>, Vec<MLDimension>)> = None;
+        let mut positive_const_slice: Option<(Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>)> = None;
 
         let read_ints = |name: &str, context: &ConversionContext| -> Option<Vec<i64>> {
-            if let Some(vals) = context.const_values.get(name) {
+            let sanitized = sanitize_identifier(name);
+            let trimmed = name.trim_start_matches('/');
+            if let Some(vals) = context
+                .const_values
+                .get(name)
+                .or_else(|| context.const_values.get(&sanitized))
+                .or_else(|| context.const_values.get(trimmed))
+            {
                 return Some(vals.clone());
             }
-            if let Some(t) = context.initializers.get(name) {
+            if let Some(t) = context
+                .initializers
+                .get(name)
+                .or_else(|| context.initializers.get(&sanitized))
+                .or_else(|| context.initializers.get(trimmed))
+            {
                 let raw = t.raw_data.as_slice();
                 if !raw.is_empty() {
                     if t.data_type == crate::protos::onnx::TensorProto_DataType::Int32 as i32 {
@@ -734,7 +862,121 @@ impl UtilityHandler {
                 ends_norm.resize(desired_len, fill);
             }
 
-            if let Some(input_shape) = context.resolve_shape(inputs[0].as_str()) {
+            let mut steps_norm = if inputs.len() >= 5 {
+                let steps_name = inputs[4].as_str();
+                read_ints(steps_name, context).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if steps_norm.len() > desired_len {
+                steps_norm.truncate(desired_len);
+            } else {
+                steps_norm.resize(desired_len, 1);
+            }
+
+            if steps_norm.iter().any(|&step| step <= 0) {
+                if desired_len != 1 {
+                    return Err(OnnxError::InvalidShape(format!(
+                        "Slice with non-positive steps only supports one axis, got {desired_len}"
+                    )));
+                }
+
+                let input_shape = context
+                    .resolve_shape(inputs[0].as_str())
+                    .cloned()
+                    .or_else(|| {
+                        b.resolve_operand(&inputs[0]).ok().and_then(|op| {
+                            b.builder
+                                .rustnn_operand_shape(op)
+                                .ok()
+                                .map(|s| s.iter().map(|&d| d as i64).collect())
+                        })
+                    })
+                    .ok_or_else(|| {
+                        OnnxError::InvalidShape(
+                            "Slice with non-positive steps requires known input shape".to_string(),
+                        )
+                    })?;
+                let rank = input_shape.len();
+                let axis = axes_opt
+                    .as_ref()
+                    .and_then(|axes| axes.first().copied())
+                    .map(|axis| normalize_axis_best_effort(axis, rank))
+                    .unwrap_or(0);
+                let axis = usize::try_from(axis).map_err(|_| {
+                    OnnxError::InvalidShape("Slice axis must be non-negative".to_string())
+                })?;
+                if axis >= input_shape.len() {
+                    return Err(OnnxError::InvalidShape(format!(
+                        "Slice axis {axis} out of bounds for rank {}",
+                        input_shape.len()
+                    )));
+                }
+
+                let indices = negative_step_slice_indices(
+                    input_shape[axis],
+                    starts_norm[0],
+                    ends_norm[0],
+                    steps_norm[0],
+                )?;
+                let indices_name = format!("{output_name}_indices");
+                let indices_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
+                b.register_constant_from_bytes(
+                    &indices_name,
+                    DataType::Int64,
+                    &[indices.len() as u32],
+                    &indices_bytes,
+                )?;
+                let input = b.resolve_operand(&inputs[0])?;
+                let indices_operand = b.resolve_operand(&indices_name)?;
+                let out = b
+                    .builder
+                    .gather_with_options(
+                        input,
+                        indices_operand,
+                        MLGatherOptions {
+                            label: output_name.clone(),
+                            axis: axis as u32,
+                        },
+                    )
+                    .map_err(map_op_error)?;
+                if let Some(output) = node.output.as_slice().first() {
+                    record_node_output(b, output, &output_name, out);
+                }
+                let mut result = ConversionResult::default();
+                if let Some(output) = node.output.as_slice().first() {
+                    if let Some(dtype) = context
+                        .value_types
+                        .get(inputs[0].as_str())
+                        .or_else(|| context.value_types.get(&sanitize_identifier(&inputs[0])))
+                    {
+                        result.output_types.insert(output.to_string(), *dtype);
+                    }
+                    let mut out_shape = input_shape;
+                    out_shape[axis] = indices.len() as i64;
+                    result.output_shapes.insert(output.to_string(), out_shape);
+                    if let Some(input_values) = context
+                        .const_values
+                        .get(inputs[0].as_str())
+                        .or_else(|| context.const_values.get(&sanitize_identifier(&inputs[0])))
+                    {
+                        if let Some(values) = gather_const_values(
+                            input_values,
+                            &result.output_shapes[output],
+                            axis,
+                            &indices,
+                        ) {
+                            result.const_values.insert(output.to_string(), values);
+                        }
+                    }
+                }
+                return Ok(result);
+            }
+
+            let build_slice_params_from_shape = |input_shape: &[i64]| -> Result<
+                (Vec<u32>, Vec<MLDimension>, Vec<i64>, Vec<i64>, Vec<i64>),
+                OnnxError,
+            > {
                 let rank = input_shape.len();
                 let mut axes = if let Some(a) = axes_opt {
                     if a.is_empty() {
@@ -753,20 +995,10 @@ impl UtilityHandler {
                     .map(|&a| normalize_axis_best_effort(a, rank))
                     .collect();
 
-                let mut steps = if inputs.len() >= 5 {
-                    let steps_name = inputs[4].as_str();
-                    read_ints(steps_name, context).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                if steps.len() > desired_len {
-                    steps.truncate(desired_len);
-                } else {
-                    steps.resize(desired_len, 1);
-                }
+                let steps = steps_norm.clone();
 
                 let mut dense_starts = vec![0i64; rank];
-                let mut dense_sizes: Vec<i64> = input_shape.clone();
+                let mut dense_sizes: Vec<i64> = input_shape.to_vec();
                 let mut dense_strides = vec![1i64; rank];
 
                 // Check if ends input has dynamic dimension metadata
@@ -824,15 +1056,81 @@ impl UtilityHandler {
                     dense_strides[axis] = step;
                 }
 
-                slice_params = Some((
+                // Cap sizes against the ONNX-inferred output shape when known.
+                // This handles the case where starts/ends defaulted to take-all but
+                // the actual slice should take fewer elements (e.g. 38 of 74).
+                let onnx_out_shape: Option<Vec<i64>> = node.output.first().and_then(|out| {
+                    let s = out.to_string();
+                    context
+                        .value_shapes
+                        .get(&s)
+                        .or_else(|| context.value_shapes.get(&sanitize_identifier(&s)))
+                        .or_else(|| context.value_shapes.get(s.trim_start_matches('/')))
+                        .cloned()
+                });
+                if let Some(ref out_shape) = onnx_out_shape {
+                    if out_shape.len() == dense_sizes.len() {
+                        for (size, &cap) in dense_sizes.iter_mut().zip(out_shape.iter()) {
+                            if cap > 0 && *size > cap {
+                                *size = cap;
+                            }
+                        }
+                    }
+                }
+
+                Ok((
                     i64_starts_as_u32(&dense_starts)?,
                     slice_sizes_from_i64(&dense_sizes, &dynamic_size_info)?,
+                    dense_starts,
+                    dense_sizes,
+                    dense_strides,
+                ))
+            };
+
+            if let Some(input_shape) = context.resolve_shape(inputs[0].as_str()) {
+                let built = build_slice_params_from_shape(&input_shape)?;
+                positive_const_slice = Some((
+                    input_shape.clone(),
+                    built.2.clone(),
+                    built.3.clone(),
+                    built.4.clone(),
                 ));
+                slice_params = Some((built.0, built.1));
             } else {
-                return Err(OnnxError::InvalidShape(
-                    "Slice on unknown-rank tensors requires known input shape for WebNN"
-                        .to_string(),
-                ));
+                // Input shape unknown from context. Try the WebNN builder's known shape,
+                // then the ONNX output shape from value_info. Still apply the actual
+                // slice params; otherwise slices degrade into no-ops.
+                let data_operand = b.resolve_operand(&inputs[0]);
+                let builder_shape: Option<Vec<i64>> = data_operand.ok().and_then(|op| {
+                    b.builder
+                        .rustnn_operand_shape(op)
+                        .ok()
+                        .map(|s| s.iter().map(|&d| d as i64).collect())
+                });
+
+                let fallback_shape = builder_shape.or_else(|| {
+                    node.output.first().and_then(|out| {
+                        let s = out.to_string();
+                        context
+                            .value_shapes
+                            .get(&s)
+                            .or_else(|| context.value_shapes.get(&sanitize_identifier(&s)))
+                            .or_else(|| context.value_shapes.get(s.trim_start_matches('/')))
+                            .cloned()
+                    })
+                });
+
+                if let Some(shape) = fallback_shape {
+                    let built = build_slice_params_from_shape(&shape)?;
+                    positive_const_slice =
+                        Some((shape, built.2.clone(), built.3.clone(), built.4.clone()));
+                    slice_params = Some((built.0, built.1));
+                } else {
+                    return Err(OnnxError::InvalidShape(
+                        "Slice on unknown-rank tensors requires known input shape for WebNN"
+                            .to_string(),
+                    ));
+                }
             }
         } else {
             // Extract from attributes (older opset)
@@ -921,6 +1219,12 @@ impl UtilityHandler {
                     dense_strides[axis] = step;
                 }
 
+                positive_const_slice = Some((
+                    input_shape.clone(),
+                    dense_starts.clone(),
+                    dense_sizes.clone(),
+                    dense_strides,
+                ));
                 slice_params = Some((
                     i64_starts_as_u32(&dense_starts)?,
                     slice_sizes_from_i64(&dense_sizes, &vec![None; rank])?,
@@ -945,17 +1249,221 @@ impl UtilityHandler {
                     .output_types
                     .insert(output.to_string(), dtype.clone());
             }
+            if let Some((_input_shape, _dense_starts, dense_sizes, _dense_strides)) =
+                positive_const_slice.as_ref()
+            {
+                result
+                    .output_shapes
+                    .insert(output.to_string(), dense_sizes.clone());
+            } else if let Ok(shape) = b.builder.rustnn_operand_shape(out) {
+                result.output_shapes.insert(
+                    output.to_string(),
+                    shape.iter().map(|&dim| dim as i64).collect(),
+                );
+            }
+            if let Some((input_shape, dense_starts, dense_sizes, dense_strides)) =
+                positive_const_slice.as_ref()
+            {
+                if let Some(input_values) = context
+                    .const_values
+                    .get(inputs[0].as_str())
+                    .or_else(|| context.const_values.get(&sanitize_identifier(&inputs[0])))
+                    .or_else(|| context.const_values.get(inputs[0].trim_start_matches('/')))
+                {
+                    if let Some(values) = slice_const_values(
+                        input_values,
+                        input_shape,
+                        dense_starts,
+                        dense_sizes,
+                        dense_strides,
+                    ) {
+                        result.const_values.insert(output.to_string(), values);
+                    }
+                }
+            }
         }
 
         Ok(result)
     }
 }
 
+fn slice_const_values(
+    input_values: &[i64],
+    input_shape: &[i64],
+    starts: &[i64],
+    sizes: &[i64],
+    strides: &[i64],
+) -> Option<Vec<i64>> {
+    let rank = input_shape.len();
+    if starts.len() != rank || sizes.len() != rank || strides.len() != rank {
+        return None;
+    }
+    if input_shape
+        .iter()
+        .chain(sizes.iter())
+        .chain(strides.iter())
+        .any(|&dim| dim < 0)
+    {
+        return None;
+    }
+    if strides.iter().any(|&stride| stride == 0) {
+        return None;
+    }
+
+    let input_numel = input_shape.iter().try_fold(1usize, |acc, &dim| {
+        usize::try_from(dim).ok().map(|d| acc.saturating_mul(d))
+    })?;
+    if input_numel != input_values.len() {
+        return None;
+    }
+
+    let output_numel = sizes.iter().try_fold(1usize, |acc, &dim| {
+        usize::try_from(dim).ok().map(|d| acc.saturating_mul(d))
+    })?;
+    if output_numel == 0 {
+        return Some(Vec::new());
+    }
+
+    let input_shape_usize: Vec<usize> = input_shape
+        .iter()
+        .map(|&dim| usize::try_from(dim).ok())
+        .collect::<Option<_>>()?;
+    let starts_usize: Vec<usize> = starts
+        .iter()
+        .map(|&start| usize::try_from(start).ok())
+        .collect::<Option<_>>()?;
+    let sizes_usize: Vec<usize> = sizes
+        .iter()
+        .map(|&size| usize::try_from(size).ok())
+        .collect::<Option<_>>()?;
+    let strides_usize: Vec<usize> = strides
+        .iter()
+        .map(|&stride| usize::try_from(stride).ok())
+        .collect::<Option<_>>()?;
+
+    let mut input_strides = vec![1usize; rank];
+    for axis in (0..rank.saturating_sub(1)).rev() {
+        input_strides[axis] = input_strides[axis + 1].saturating_mul(input_shape_usize[axis + 1]);
+    }
+
+    let mut output_strides = vec![1usize; rank];
+    for axis in (0..rank.saturating_sub(1)).rev() {
+        output_strides[axis] = output_strides[axis + 1].saturating_mul(sizes_usize[axis + 1]);
+    }
+
+    let mut output = Vec::with_capacity(output_numel);
+    for output_index in 0..output_numel {
+        let mut remaining = output_index;
+        let mut input_index = 0usize;
+        for axis in 0..rank {
+            let coord = if output_strides[axis] == 0 {
+                0
+            } else {
+                remaining / output_strides[axis]
+            };
+            remaining %= output_strides[axis].max(1);
+            let input_coord = starts_usize[axis].checked_add(coord * strides_usize[axis])?;
+            if input_coord >= input_shape_usize[axis] {
+                return None;
+            }
+            input_index = input_index.checked_add(input_coord * input_strides[axis])?;
+        }
+        output.push(*input_values.get(input_index)?);
+    }
+    Some(output)
+}
+
+fn gather_const_values(
+    input_values: &[i64],
+    output_shape: &[i64],
+    axis: usize,
+    indices: &[i64],
+) -> Option<Vec<i64>> {
+    if output_shape.is_empty() || axis >= output_shape.len() {
+        return None;
+    }
+    let output_numel = output_shape.iter().try_fold(1usize, |acc, &dim| {
+        usize::try_from(dim).ok().map(|d| acc.saturating_mul(d))
+    })?;
+    if output_numel == 0 {
+        return Some(Vec::new());
+    }
+    let axis_len = indices.len();
+    if axis_len == 0 || output_shape[axis] != axis_len as i64 {
+        return None;
+    }
+
+    let inner = output_shape[axis + 1..]
+        .iter()
+        .try_fold(1usize, |acc, &dim| {
+            usize::try_from(dim).ok().map(|d| acc.saturating_mul(d))
+        })?;
+    let outer = output_shape[..axis].iter().try_fold(1usize, |acc, &dim| {
+        usize::try_from(dim).ok().map(|d| acc.saturating_mul(d))
+    })?;
+    let input_axis_len = input_values.len().checked_div(outer.checked_mul(inner)?)?;
+    if input_axis_len == 0 {
+        return None;
+    }
+
+    let mut output = Vec::with_capacity(output_numel);
+    for outer_idx in 0..outer {
+        for &index in indices {
+            let input_axis = usize::try_from(index).ok()?;
+            if input_axis >= input_axis_len {
+                return None;
+            }
+            let start = (outer_idx * input_axis_len + input_axis).checked_mul(inner)?;
+            let end = start.checked_add(inner)?;
+            output.extend_from_slice(input_values.get(start..end)?);
+        }
+    }
+    Some(output)
+}
+
+fn negative_step_slice_indices(
+    dim: i64,
+    start: i64,
+    end: i64,
+    step: i64,
+) -> Result<Vec<i64>, OnnxError> {
+    if dim <= 0 {
+        return Err(OnnxError::InvalidShape(format!(
+            "Slice negative step requires positive axis length, got {dim}"
+        )));
+    }
+    if step >= 0 {
+        return Err(OnnxError::InvalidShape(format!(
+            "Slice negative-step lowering got non-negative step {step}"
+        )));
+    }
+
+    let mut normalized_start = start;
+    if normalized_start < 0 {
+        normalized_start = normalized_start.saturating_add(dim);
+    }
+    normalized_start = normalized_start.clamp(0, dim - 1);
+
+    let mut normalized_end = end;
+    if normalized_end < 0 {
+        normalized_end = normalized_end.saturating_add(dim);
+    }
+    normalized_end = normalized_end.clamp(-1, dim - 1);
+
+    let mut indices = Vec::new();
+    let mut index = normalized_start;
+    while index > normalized_end {
+        indices.push(index);
+        index = index.saturating_add(step);
+    }
+    Ok(indices)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustnn::DataType;
     use crate::protos::onnx::{AttributeProto, NodeProto, TensorProto, TensorProto_DataType};
+    use rustnn::DataType;
     fn create_test_node(op_type: &str, inputs: Vec<&str>, outputs: Vec<&str>) -> NodeProto {
         NodeProto {
             op_type: op_type.to_string(),
@@ -1104,8 +1612,106 @@ mod tests {
             value_types: &value_types,
         };
 
-        let result = crate::onnx::ops::convert_handler_with_context(&handler, &node, &context).unwrap();
+        let result =
+            crate::onnx::ops::convert_handler_with_context(&handler, &node, &context).unwrap();
         assert_eq!(result.output_types.get("output"), Some(&DataType::Float32));
+    }
+
+    #[test]
+    fn test_convert_constant_of_shape_bool_outputs_uint8() {
+        let handler = UtilityHandler;
+        let mut node = create_test_node("ConstantOfShape", vec!["shape"], vec!["mask"]);
+        node.attribute.push(AttributeProto {
+            name: "value".to_string(),
+            t: Some(TensorProto {
+                data_type: TensorProto_DataType::Bool as i32,
+                dims: vec![],
+                raw_data: vec![1],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let value_shape_dims = std::collections::HashMap::new();
+        let mut const_values = std::collections::HashMap::new();
+        const_values.insert("shape".to_string(), vec![2, 3]);
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
+        let context = ConversionContext {
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            value_shape_dims: &value_shape_dims,
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
+        };
+
+        let result =
+            crate::onnx::ops::convert_handler_with_context(&handler, &node, &context).unwrap();
+        assert_eq!(result.output_types.get("mask"), Some(&DataType::Uint8));
+    }
+
+    #[test]
+    fn test_convert_gather_folds_negative_axis0_index() {
+        let handler = UtilityHandler;
+        let node = create_test_node("Gather", vec!["data", "indices"], vec!["last"]);
+        let initializers = std::collections::HashMap::new();
+        let mut value_shapes = std::collections::HashMap::new();
+        value_shapes.insert("indices".to_string(), vec![1]);
+        let mut const_values = std::collections::HashMap::new();
+        const_values.insert("data".to_string(), vec![10, 20, 30]);
+        const_values.insert("indices".to_string(), vec![-1]);
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
+        let context = ConversionContext {
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
+        };
+
+        let result =
+            crate::onnx::ops::convert_handler_with_context(&handler, &node, &context).unwrap();
+        assert_eq!(result.const_values.get("last"), Some(&vec![30]));
+        assert_eq!(result.output_shapes.get("last"), Some(&vec![1]));
+    }
+
+    #[test]
+    fn test_convert_range_rejects_zero_delta() {
+        let handler = UtilityHandler;
+        let node = create_test_node("Range", vec!["start", "limit", "delta"], vec!["range"]);
+        let initializers = std::collections::HashMap::new();
+        let value_shapes = std::collections::HashMap::new();
+        let mut const_values = std::collections::HashMap::new();
+        const_values.insert("start".to_string(), vec![0]);
+        const_values.insert("limit".to_string(), vec![4]);
+        const_values.insert("delta".to_string(), vec![0]);
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
+        let context = ConversionContext {
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
+        };
+
+        let err = crate::onnx::ops::convert_handler_with_context(&handler, &node, &context)
+            .expect_err("expected zero-delta Range rejection");
+        assert!(err.to_string().contains("delta cannot be zero"));
+    }
+
+    #[test]
+    fn test_negative_step_slice_indices_include_reversed_extent() {
+        assert_eq!(
+            negative_step_slice_indices(5, 4, -6, -1).unwrap(),
+            vec![4, 3, 2, 1, 0]
+        );
     }
 
     #[test]
@@ -1127,7 +1733,8 @@ mod tests {
             value_types: &value_types,
         };
 
-        let result = crate::onnx::ops::convert_handler_with_context(&handler, &node, &context).unwrap();
+        let result =
+            crate::onnx::ops::convert_handler_with_context(&handler, &node, &context).unwrap();
         assert_eq!(result.output_types.get("y"), Some(&DataType::Float32));
     }
 
@@ -1152,7 +1759,8 @@ mod tests {
             value_types: &value_types,
         };
 
-        let result = crate::onnx::ops::convert_handler_with_context(&handler, &node, &context).unwrap();
+        let result =
+            crate::onnx::ops::convert_handler_with_context(&handler, &node, &context).unwrap();
         assert_eq!(result.output_types.get("y"), Some(&DataType::Float16));
     }
 }

@@ -121,6 +121,9 @@ impl TensorData {
                 x if x == TensorProto_DataType::Uint8 as i32 => {
                     Ok(TensorData::UInt8(raw_data.to_vec()))
                 }
+                x if x == TensorProto_DataType::Bool as i32 => Ok(TensorData::UInt8(
+                    raw_data.iter().map(|&x| u8::from(x != 0)).collect(),
+                )),
                 x if x == TensorProto_DataType::Int8 as i32 => Ok(TensorData::Int8(
                     raw_data.iter().map(|&x| x as i8).collect(),
                 )),
@@ -143,6 +146,14 @@ impl TensorData {
                 x if x == TensorProto_DataType::Double as i32 => {
                     Ok(TensorData::Float64(tensor.double_data.as_slice().to_vec()))
                 }
+                x if x == TensorProto_DataType::Bool as i32 => Ok(TensorData::UInt8(
+                    tensor
+                        .int32_data
+                        .as_slice()
+                        .iter()
+                        .map(|&x| u8::from(x != 0))
+                        .collect(),
+                )),
                 _ => Err(OnnxError::TypeConversion(
                     webnn_onnx_utils::error::ConversionError::UnsupportedOnnxDataType(data_type),
                 )),

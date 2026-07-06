@@ -24,12 +24,12 @@ use crate::onnx::builder_helpers::{
     merge_dims_with_static_values, output_label, record_node_output, reshape_with_shape,
     u32_slice_to_mldim,
 };
-use crate::onnx::shape_inference::value_shape_dims_for;
 use crate::onnx::convert::{sanitize_identifier, OnnxError};
 use crate::onnx::ops::{
     normalize_axes_best_effort, normalize_axis_best_effort, ConversionContext, ConversionResult,
     OpHandler,
 };
+use crate::onnx::shape_inference::{static_shape_from_dims, value_shape_dims_for};
 use crate::protos::onnx::{NodeProto, TensorProto_DataType};
 use rustnn::operator_options::{
     MLDimension, MLSplitOptions, MLSqueezeOptions, MLTransposeOptions, MLUnsqueezeOptions,
@@ -63,7 +63,8 @@ impl OpHandler for ReshapeHandler {
         let node_name = if !node.name.is_empty() {
             node.name.as_str().to_string()
         } else {
-            node.output.first()
+            node.output
+                .first()
                 .map(|s| crate::onnx::convert::sanitize_identifier(s))
                 .unwrap_or_else(|| node.op_type.to_string())
         };
@@ -87,6 +88,147 @@ impl OpHandler for ReshapeHandler {
 }
 
 impl ReshapeHandler {
+    fn initializer_i64_values(context: &ConversionContext<'_>, name: &str) -> Option<Vec<i64>> {
+        let initializer = context.initializers.get(name)?;
+        let raw_data = initializer.raw_data.as_slice();
+        if !raw_data.is_empty() {
+            return Some(match initializer.data_type {
+                x if x == TensorProto_DataType::Int32 as i32 => raw_data
+                    .chunks_exact(4)
+                    .map(|chunk| {
+                        i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as i64
+                    })
+                    .collect(),
+                _ => raw_data
+                    .chunks_exact(8)
+                    .map(|chunk| {
+                        i64::from_le_bytes([
+                            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
+                            chunk[7],
+                        ])
+                    })
+                    .collect(),
+            });
+        }
+        if !initializer.int64_data.as_slice().is_empty() {
+            return Some(initializer.int64_data.as_slice().to_vec());
+        }
+        if !initializer.int32_data.as_slice().is_empty() {
+            return Some(
+                initializer
+                    .int32_data
+                    .as_slice()
+                    .iter()
+                    .map(|&v| v as i64)
+                    .collect(),
+            );
+        }
+        None
+    }
+
+    fn const_i64_values(context: &ConversionContext<'_>, name: &str) -> Option<Vec<i64>> {
+        context
+            .const_values
+            .get(name)
+            .or_else(|| {
+                let sanitized = sanitize_identifier(name);
+                context.const_values.get(&sanitized)
+            })
+            .or_else(|| context.const_values.get(name.trim_start_matches('/')))
+            .cloned()
+            .or_else(|| Self::initializer_i64_values(context, name))
+    }
+
+    fn transpose_const_values(
+        values: &[i64],
+        input_shape: &[i64],
+        permutation: &[usize],
+    ) -> Option<Vec<i64>> {
+        if input_shape.len() != permutation.len()
+            || input_shape.iter().any(|&dim| dim < 0)
+            || permutation.iter().any(|&axis| axis >= input_shape.len())
+        {
+            return None;
+        }
+        let input_numel = input_shape.iter().try_fold(1usize, |acc, &dim| {
+            usize::try_from(dim).ok().map(|d| acc.saturating_mul(d))
+        })?;
+        if input_numel != values.len() {
+            return None;
+        }
+
+        let output_shape: Vec<usize> = permutation
+            .iter()
+            .map(|&axis| usize::try_from(input_shape[axis]).ok())
+            .collect::<Option<_>>()?;
+        let mut input_strides = vec![1usize; input_shape.len()];
+        for axis in (0..input_shape.len().saturating_sub(1)).rev() {
+            input_strides[axis] = input_strides[axis + 1]
+                .saturating_mul(usize::try_from(input_shape[axis + 1]).ok()?);
+        }
+        let mut output_strides = vec![1usize; output_shape.len()];
+        for axis in (0..output_shape.len().saturating_sub(1)).rev() {
+            output_strides[axis] = output_strides[axis + 1].saturating_mul(output_shape[axis + 1]);
+        }
+
+        let mut output = vec![0i64; values.len()];
+        for (out_index, out_value) in output.iter_mut().enumerate() {
+            let mut remaining = out_index;
+            let mut input_index = 0usize;
+            for axis in 0..output_shape.len() {
+                let coord = if output_strides[axis] == 0 {
+                    0
+                } else {
+                    remaining / output_strides[axis]
+                };
+                remaining %= output_strides[axis].max(1);
+                input_index = input_index.saturating_add(coord * input_strides[permutation[axis]]);
+            }
+            *out_value = values[input_index];
+        }
+        Some(output)
+    }
+
+    fn repair_stale_hidden_split_shape(
+        input_shape: &[i64],
+        target_shape: &[i64],
+        infer_index: usize,
+    ) -> Option<Vec<u32>> {
+        if input_shape.len() < 2 || target_shape.len() != input_shape.len() + 1 || infer_index != 1
+        {
+            return None;
+        }
+        let hidden = *input_shape.last()?;
+        if target_shape.first().copied()? != hidden {
+            return None;
+        }
+        let split_product =
+            target_shape[infer_index + 1..]
+                .iter()
+                .try_fold(
+                    1i64,
+                    |acc, &dim| {
+                        if dim <= 0 {
+                            None
+                        } else {
+                            acc.checked_mul(dim)
+                        }
+                    },
+                )?;
+        if split_product != hidden {
+            return None;
+        }
+
+        let mut repaired = Vec::with_capacity(target_shape.len());
+        for &dim in &input_shape[..input_shape.len() - 1] {
+            repaired.push(u32::try_from(dim).ok()?);
+        }
+        for &dim in &target_shape[infer_index + 1..] {
+            repaired.push(u32::try_from(dim).ok()?);
+        }
+        Some(repaired)
+    }
+
     fn record_output(
         b: &mut OnnxBuilder<'_, '_, '_>,
         node: &NodeProto,
@@ -96,12 +238,20 @@ impl ReshapeHandler {
         dtype_input: Option<&str>,
     ) -> Result<ConversionResult, OnnxError> {
         if let Some(onnx_out) = node.output.first() {
+            let output_shape = b
+                .builder
+                .rustnn_operand_shape(op)
+                .ok()
+                .map(|shape| shape.into_iter().map(|dim| dim as i64).collect());
             record_node_output(b, onnx_out, label, op);
             let mut result = ConversionResult::default();
             if let Some(inp) = dtype_input {
                 if let Some(dtype) = context.value_types.get(inp) {
                     result.output_types.insert(onnx_out.clone(), dtype.clone());
                 }
+            }
+            if let Some(shape) = output_shape {
+                result.output_shapes.insert(onnx_out.clone(), shape);
             }
             Ok(result)
         } else {
@@ -245,94 +395,54 @@ impl ReshapeHandler {
         let data_input = b.resolve_operand(&data_input_raw)?;
 
         // Resolve shape from const-folded values or initializers
-        let mut shape_values: Vec<i64> =
-            if let Some(values) = context.const_values.get(&shape_input_raw) {
-                values.clone()
-            } else if let Some(initializer) = context.initializers.get(shape_input_raw.as_str()) {
-                let raw_data = initializer.raw_data.as_slice();
-                if !raw_data.is_empty() {
-                    match initializer.data_type {
-                        x if x == TensorProto_DataType::Int32 as i32 => raw_data
-                            .chunks_exact(4)
-                            .map(|chunk| {
-                                i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as i64
-                            })
-                            .collect(),
-                        _ => raw_data
-                            .chunks_exact(8)
-                            .map(|chunk| {
-                                i64::from_le_bytes([
-                                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5],
-                                    chunk[6], chunk[7],
-                                ])
-                            })
-                            .collect(),
-                    }
-                } else if !initializer.int64_data.as_slice().is_empty() {
-                    initializer.int64_data.as_slice().to_vec()
-                } else if !initializer.int32_data.as_slice().is_empty() {
-                    initializer
-                        .int32_data
-                        .as_slice()
-                        .iter()
-                        .map(|&v| v as i64)
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
+        let mut shape_values: Vec<i64> = if let Some(values) =
+            context.const_values.get(&shape_input_raw)
+        {
+            values.clone()
+        } else if let Some(values) = Self::initializer_i64_values(context, shape_input_raw.as_str())
+        {
+            values
+        } else {
+            Vec::new()
+        };
         let shape_from_const = !shape_values.is_empty();
 
-        // Fallback: derive shape from known output/shape-input metadata when the shape tensor isn't const.
+        if shape_values.is_empty() {
+            if let Some(values) = Self::initializer_i64_values(context, shape_input_raw.as_str()) {
+                shape_values = values;
+            }
+        }
+
+        // Fallback: derive a candidate target shape from known output metadata when the
+        // shape tensor itself is not const. Do not emit immediately from this metadata:
+        // later reconciliation needs a chance to compare it with the real input element
+        // count and repair stale ONNX value_info.
         if shape_values.is_empty() {
             if let Some(out) = node.output.as_slice().first() {
-                if let Some(output_dims) = value_shape_dims_for(out.as_str(), &context.value_shape_dims)
+                if let Some(output_dims) =
+                    value_shape_dims_for(out.as_str(), &context.value_shape_dims)
                 {
-                    if !output_dims.is_empty() {
-                        let new_shape = ast_dims_to_mldim(output_dims);
-                        return Self::emit_reshape_with_shape(
-                            b,
-                            node,
-                            &output_name,
-                            data_input,
-                            new_shape,
-                            context,
-                            &data_input_raw,
-                        );
+                    if let Some(output_shape) = static_shape_from_dims(output_dims) {
+                        if !output_shape.is_empty() {
+                            shape_values = output_shape;
+                        }
                     }
                 }
             }
 
-            if let Some(shape_dims) =
-                value_shape_dims_for(shape_input_raw.as_str(), &context.value_shape_dims)
-            {
-                if !shape_dims.is_empty() {
-                    let new_shape = ast_dims_to_mldim(shape_dims);
-                    return Self::emit_reshape_with_shape(
-                        b,
-                        node,
-                        &output_name,
-                        data_input,
-                        new_shape,
-                        context,
-                        &data_input_raw,
-                    );
-                }
-            }
-
-            if let Some(out_name) = node.output.as_slice().first() {
-                let out_s = out_name.to_string();
-                let known_output_shape = context
-                    .value_shapes
-                    .get(&out_s)
-                    .or_else(|| context.value_shapes.get(&sanitize_identifier(&out_s)))
-                    .or_else(|| context.value_shapes.get(out_s.trim_start_matches('/')))
-                    .cloned();
-                if let Some(out_shape) = known_output_shape {
-                    if !out_shape.is_empty() && out_shape.iter().all(|&d| d > 0) {
-                        shape_values = out_shape;
+            if shape_values.is_empty() {
+                if let Some(out_name) = node.output.as_slice().first() {
+                    let out_s = out_name.to_string();
+                    let known_output_shape = context
+                        .value_shapes
+                        .get(&out_s)
+                        .or_else(|| context.value_shapes.get(&sanitize_identifier(&out_s)))
+                        .or_else(|| context.value_shapes.get(out_s.trim_start_matches('/')))
+                        .cloned();
+                    if let Some(out_shape) = known_output_shape {
+                        if !out_shape.is_empty() && out_shape.iter().all(|&d| d > 0) {
+                            shape_values = out_shape;
+                        }
                     }
                 }
             }
@@ -347,14 +457,6 @@ impl ReshapeHandler {
                 // Do not collapse higher-rank inputs to rank-3; that breaks reshape
                 // targets built from Concat shape vectors (e.g. SmolLM attention).
                 shape_values = ds.clone();
-                if output_name.contains("layers_15_self_attn") && output_name.contains("Reshape") {
-                    crate::debug_println!(
-                        "[RESHAPE FALLBACK] {} from input {:?} -> {:?}",
-                        output_name,
-                        ds,
-                        shape_values
-                    );
-                }
             } else {
                 return Err(OnnxError::InvalidShape(format!(
                     "Reshape shape input '{}' must be a constant (initializer/constant-folded) or input shape must be known. \
@@ -362,29 +464,24 @@ impl ReshapeHandler {
                     shape_input_raw, data_input_raw
                 )));
             }
-        } else if shape_from_const
-            && output_name.contains("layers_15_self_attn")
-            && output_name.contains("Reshape")
-        {
-            // Debug: track const-derived shapes for layer 15
-            crate::debug_println!(
-                "[RESHAPE CONST] {} newShape from const -> {:?}",
-                output_name,
-                shape_values
-            );
         }
 
         // Handle -1 (dimension inference marker) - compute the inferred dimension
         // WebNN requires all dimensions to be explicit, so we need to resolve -1 values
-        let input_shape_opt = {
-            let trimmed = data_input_raw.trim_start_matches('/');
-            context
-                .value_shapes
-                .get(data_input_raw.as_str())
-                .or_else(|| context.value_shapes.get(&data_input_raw))
-                .or_else(|| context.value_shapes.get(trimmed))
-                .cloned()
-        };
+        let input_shape_opt = b
+            .builder
+            .rustnn_operand_shape(data_input)
+            .ok()
+            .map(|shape| shape.into_iter().map(|dim| dim as i64).collect())
+            .or_else(|| {
+                let trimmed = data_input_raw.trim_start_matches('/');
+                context
+                    .value_shapes
+                    .get(data_input_raw.as_str())
+                    .or_else(|| context.value_shapes.get(&data_input_raw))
+                    .or_else(|| context.value_shapes.get(trimmed))
+                    .cloned()
+            });
 
         let shape_values: Vec<u32> = if shape_values.contains(&-1) {
             // Prefer strict inference when we know the input shape; otherwise fall back to
@@ -429,6 +526,26 @@ impl ReshapeHandler {
                 if let Some(idx) = infer_index {
                     let inferred_dim = total_elements / known_product;
                     if inferred_dim <= 0 || total_elements % known_product != 0 {
+                        if let Some(repaired_shape) =
+                            Self::repair_stale_hidden_split_shape(&input_shape, &shape_values, idx)
+                        {
+                            crate::debug_println!(
+                                "[reshape] repaired stale hidden split shape: {} input_shape={:?} target_shape={:?} repaired_shape={:?}",
+                                output_name,
+                                input_shape,
+                                shape_values,
+                                repaired_shape
+                            );
+                            return Self::emit_reshape_with_shape(
+                                b,
+                                node,
+                                &output_name,
+                                data_input,
+                                u32_slice_to_mldim(&repaired_shape),
+                                context,
+                                &data_input_raw,
+                            );
+                        }
                         // Some decoder models (e.g. GPT exports with KV-cache inputs) can carry
                         // partially-known intermediate shapes even after override resolution.
                         // In those cases, prefer the existing best-effort fallback instead of
@@ -484,26 +601,73 @@ impl ReshapeHandler {
 
             // If element counts don't match, repair using available hints.
             if total_input > 0 && total_target > 0 && total_input != total_target {
-                // Rebuild using batch/seq hints (from known inputs) and hidden from target.
-                let mut batch_hint = input_shape.first().copied().unwrap_or(1);
-                let mut seq_hint = input_shape.get(1).copied().unwrap_or(1);
-                for (name, shape) in context.value_shapes.iter() {
-                    if shape.len() >= 2 && !context.initializers.contains_key(name) {
-                        if shape[0] > batch_hint {
-                            batch_hint = shape[0];
+                let mut one_dim_repairs = Vec::new();
+                if !shape_from_const {
+                    for idx in 0..shape_values.len() {
+                        let other_product: i64 = shape_values
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| *i != idx)
+                            .map(|(_, &dim)| dim)
+                            .product();
+                        if other_product <= 0 || total_input % other_product != 0 {
+                            continue;
                         }
-                        if shape[1] > seq_hint {
-                            seq_hint = shape[1];
+                        let repaired_dim = total_input / other_product;
+                        if repaired_dim > 0 && repaired_dim != shape_values[idx] {
+                            let mut repaired = shape_values.clone();
+                            repaired[idx] = repaired_dim;
+                            one_dim_repairs.push(repaired);
                         }
                     }
                 }
 
-                let hidden = shape_values.last().copied().unwrap_or(1);
-                crate::debug_println!(
-                    "[reshape] repair: {} input_shape={:?} target_shape={:?} batch_hint={} seq_hint={} hidden={}",
-                    output_name, input_shape, shape_values, batch_hint, seq_hint, hidden
-                );
-                candidate = vec![batch_hint, seq_hint, hidden];
+                if one_dim_repairs.len() == 1 {
+                    candidate = one_dim_repairs.pop().unwrap();
+                    crate::debug_println!(
+                        "[reshape] repair via one-dim solve: {} input_shape={:?} target_shape={:?} repaired_shape={:?}",
+                        output_name,
+                        input_shape,
+                        shape_values,
+                        candidate
+                    );
+                } else if !shape_from_const && input_shape.len() == 4 && shape_values.len() == 3 {
+                    let tail: i64 = input_shape[2..].iter().product();
+                    candidate = vec![input_shape[0], input_shape[1], tail];
+                    crate::debug_println!(
+                        "[reshape] repair via input flatten: {} input_shape={:?} target_shape={:?} repaired_shape={:?}",
+                        output_name,
+                        input_shape,
+                        shape_values,
+                        candidate
+                    );
+                } else {
+                    // Rebuild using batch/seq hints (from known inputs) and hidden from target.
+                    let mut batch_hint = input_shape.first().copied().unwrap_or(1);
+                    let mut seq_hint = input_shape.get(1).copied().unwrap_or(1);
+                    for (name, shape) in context.value_shapes.iter() {
+                        if shape.len() >= 2 && !context.initializers.contains_key(name) {
+                            if shape[0] > batch_hint {
+                                batch_hint = shape[0];
+                            }
+                            if shape[1] > seq_hint {
+                                seq_hint = shape[1];
+                            }
+                        }
+                    }
+
+                    let hidden = shape_values.last().copied().unwrap_or(1);
+                    crate::debug_println!(
+                        "[reshape] repair via fallback hints: {} input_shape={:?} target_shape={:?} batch_hint={} seq_hint={} hidden={}",
+                        output_name,
+                        input_shape,
+                        shape_values,
+                        batch_hint,
+                        seq_hint,
+                        hidden
+                    );
+                    candidate = vec![batch_hint, seq_hint, hidden];
+                }
             } else if !shape_from_const && !input_shape.is_empty() {
                 // If the target is rank-3 and the input is rank-4, flatten the last two dims.
                 if input_shape.len() == 4 && shape_values.len() == 3 {
@@ -513,15 +677,6 @@ impl ReshapeHandler {
             }
             candidate.iter().map(|&v| v as u32).collect()
         };
-
-        // Debug: final shape for layer 15
-        if output_name.contains("layers_15_self_attn") && output_name.contains("Reshape") {
-            crate::debug_println!(
-                "[RESHAPE FINAL] {} final newShape -> {:?}",
-                output_name,
-                shape_values
-            );
-        }
 
         let new_shape = node
             .output
@@ -550,7 +705,7 @@ impl ReshapeHandler {
             })
             .unwrap_or_else(|| u32_slice_to_mldim(&shape_values));
 
-        Self::emit_reshape_with_shape(
+        let mut result = Self::emit_reshape_with_shape(
             b,
             node,
             &output_name,
@@ -558,7 +713,13 @@ impl ReshapeHandler {
             new_shape,
             context,
             &data_input_raw,
-        )
+        )?;
+        if let Some(values) = Self::const_i64_values(context, data_input_raw.as_str()) {
+            if let Some(output) = node.output.as_slice().first() {
+                result.const_values.insert(output.to_string(), values);
+            }
+        }
+        Ok(result)
     }
 
     /// Convert ONNX Expand to WebNN expand (broadcast to target shape)
@@ -582,21 +743,6 @@ impl ReshapeHandler {
         let shape_input_raw = inputs[1].to_string();
         let data_input = b.resolve_operand(&data_input_raw)?;
 
-        // Debug logging for all Expand operations
-        if shape_input_raw.contains("rotary") || data_input_raw.contains("rotary") {
-            crate::debug_println!("[EXPAND DEBUG] Node: {}", node_name);
-            crate::debug_println!("  data_input_raw: {}", data_input_raw);
-            crate::debug_println!("  shape_input_raw: {}", shape_input_raw);
-            crate::debug_println!(
-                "  In const_values: {}",
-                context.const_values.contains_key(&shape_input_raw)
-            );
-            crate::debug_println!(
-                "  In initializers: {}",
-                context.initializers.contains_key(shape_input_raw.as_str())
-            );
-        }
-
         let shape_key_sanitized = sanitize_identifier(&shape_input_raw);
         let shape_key_trimmed = shape_input_raw.trim_start_matches('/').to_string();
 
@@ -606,14 +752,8 @@ impl ReshapeHandler {
             .or_else(|| context.const_values.get(&shape_key_sanitized))
             .or_else(|| context.const_values.get(&shape_key_trimmed))
         {
-            if shape_input_raw.contains("rotary") || data_input_raw.contains("rotary") {
-                crate::debug_println!("  Shape from const_values: {:?}", values);
-            }
             values.clone()
         } else if let Some(initializer) = context.initializers.get(shape_input_raw.as_str()) {
-            if shape_input_raw.contains("rotary") || data_input_raw.contains("rotary") {
-                crate::debug_println!("  Shape from initializer");
-            }
             let raw_data = initializer.raw_data.as_slice();
             if !raw_data.is_empty() {
                 match initializer.data_type {
@@ -649,9 +789,39 @@ impl ReshapeHandler {
             Vec::new()
         };
 
-        if shape_values.iter().all(|&v| v == 1) {
+        let all_ones_placeholder = !shape_values.is_empty() && shape_values.iter().all(|&v| v == 1);
+        if all_ones_placeholder {
             // All-ones placeholders from Where(ConstantOfShape, …) are not reliable target shapes.
             shape_values.clear();
+        }
+
+        let input_shape_for_expand = context.resolve_shape(&data_input_raw).cloned();
+        if shape_values.iter().any(|&v| v < 0) {
+            let Some(input_shape) = input_shape_for_expand.as_ref() else {
+                return Err(OnnxError::InvalidShape(format!(
+                    "Expand {} has negative target dimensions {:?} but input shape is unknown",
+                    node_name, shape_values
+                )));
+            };
+            let target_rank = shape_values.len();
+            let input_rank = input_shape.len();
+            let rank_offset = target_rank.saturating_sub(input_rank);
+            for (axis, dim) in shape_values.iter_mut().enumerate() {
+                if *dim == -1 {
+                    if axis < rank_offset {
+                        return Err(OnnxError::InvalidShape(format!(
+                            "Expand {} cannot copy leading -1 dimension from input shape {:?}",
+                            node_name, input_shape
+                        )));
+                    }
+                    *dim = input_shape[axis - rank_offset];
+                } else if *dim < -1 {
+                    return Err(OnnxError::InvalidShape(format!(
+                        "Expand {} has invalid negative target dimension {}",
+                        node_name, dim
+                    )));
+                }
+            }
         }
 
         let shape_input_dim_shape = context
@@ -679,7 +849,9 @@ impl ReshapeHandler {
             output_dim_shape.as_ref().and_then(|dims| {
                 merge_dims_with_i64_values(dims, &shape_values).or_else(|| {
                     if shape_values.is_empty()
-                        && dims.iter().any(|d| matches!(d, rustnn::graph::Dimension::Dynamic(_)))
+                        && dims
+                            .iter()
+                            .any(|d| matches!(d, rustnn::graph::Dimension::Dynamic(_)))
                     {
                         Some(ast_dims_to_mldim(dims))
                     } else {
@@ -687,7 +859,17 @@ impl ReshapeHandler {
                     }
                 })
             });
-        let shape_values: Vec<i64> = if shape_values.is_empty() {
+        // If shape_values has fewer elements than the input rank, it can't be a valid
+        // target shape for broadcasting (output rank must be >= input rank). Treat as
+        // invalid and let the fallback use the ONNX-inferred output shape instead.
+        let input_rank_for_check = input_shape_for_expand
+            .as_ref()
+            .map(|s| s.len())
+            .unwrap_or(0);
+        let shape_values_invalid =
+            !shape_values.is_empty() && shape_values.len() < input_rank_for_check;
+
+        let shape_values: Vec<i64> = if shape_values.is_empty() || shape_values_invalid {
             let output_shape_opt = node
                 .output
                 .as_slice()
@@ -717,6 +899,8 @@ impl ReshapeHandler {
                 } else {
                     Vec::new()
                 }
+            } else if input_shape_for_expand.is_some() {
+                input_shape_for_expand.clone().unwrap_or_default()
             } else {
                 Vec::new()
             }
@@ -735,11 +919,21 @@ impl ReshapeHandler {
             }
         }
 
-        let shape_u32: Vec<u32> = shape_values.iter().map(|&v| v as u32).collect();
+        let shape_u32: Vec<u32> = shape_values
+            .iter()
+            .map(|&v| {
+                u32::try_from(v).map_err(|_| {
+                    OnnxError::InvalidShape(format!(
+                        "Expand {} target dimension {} cannot be represented as u32",
+                        node_name, v
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
 
         // Determine if this is a broadcast (WebNN expand) or reshape operation
         // by checking if shapes are broadcast-compatible (ONNX Expand rules)
-        let input_shape = context.value_shapes.get(&data_input_raw);
+        let input_shape = input_shape_for_expand.as_ref();
         let op_type = if dynamic_new_shape.is_some() {
             "expand"
         } else if let Some(input_shape) = input_shape {
@@ -811,7 +1005,7 @@ impl ReshapeHandler {
         &self,
         node: &NodeProto,
         node_name: &str,
-        _context: &ConversionContext,
+        context: &ConversionContext,
         b: &mut OnnxBuilder<'_, '_, '_>,
     ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.input.as_slice();
@@ -832,19 +1026,37 @@ impl ReshapeHandler {
 
         let output_name = output_label(node, node_name);
         let input0 = b.resolve_operand(&inputs[0])?;
+        let input_shape = context.resolve_shape(inputs[0].as_str()).cloned();
+        let permutation: Vec<usize> = perm
+            .clone()
+            .unwrap_or_else(|| {
+                input_shape
+                    .as_ref()
+                    .map(|shape| (0..shape.len() as i64).rev().collect())
+                    .unwrap_or_default()
+            })
+            .into_iter()
+            .map(|axis| axis as usize)
+            .collect();
         let opts = MLTransposeOptions {
             label: output_name.clone(),
-            permutation: perm
-                .unwrap_or_default()
-                .into_iter()
-                .map(|a| a as u32)
-                .collect(),
+            permutation: permutation.iter().map(|&axis| axis as u32).collect(),
         };
         let out = b
             .builder
             .transpose_with_options(input0, opts)
             .map_err(map_op_error)?;
-        Self::record_output(b, node, &output_name, out, _context, None)
+        let mut result = Self::record_output(b, node, &output_name, out, context, None)?;
+        if let (Some(values), Some(shape), Some(output)) = (
+            Self::const_i64_values(context, inputs[0].as_str()),
+            input_shape.as_ref(),
+            node.output.as_slice().first(),
+        ) {
+            if let Some(transposed) = Self::transpose_const_values(&values, shape, &permutation) {
+                result.const_values.insert(output.to_string(), transposed);
+            }
+        }
+        Ok(result)
     }
 
     /// Convert ONNX Concat to WebNN concat
@@ -872,21 +1084,58 @@ impl ReshapeHandler {
         }
 
         let output_name = output_label(node, node_name);
-        let operands: Result<Vec<_>, _> = inputs.iter().map(|s| b.resolve_operand(s)).collect();
-        let axis = if let Some(rank) = context.input_rank(inputs[0].as_str()) {
+        let input_ranks: Vec<Option<usize>> = inputs
+            .iter()
+            .map(|input| context.input_rank(input.as_str()))
+            .collect();
+        let target_rank = input_ranks.iter().flatten().copied().max();
+        let axis = if let Some(rank) = target_rank {
             normalize_axis_best_effort(axis, rank)
         } else {
+            // Rank unknown: pass axis as-is; negative values will be u32-wrapped and
+            // the shape_inference layer will normalize them against the actual rank.
             axis
         };
+        let mut operands = Vec::with_capacity(inputs.len());
+        for (index, input) in inputs.iter().enumerate() {
+            let mut operand = b.resolve_operand(input)?;
+            if target_rank == Some(1) && axis == 0 && input_ranks[index] == Some(0) {
+                operand = reshape_with_shape(
+                    b,
+                    operand,
+                    &format!("{output_name}_scalar_{index}"),
+                    vec![MLDimension::Static(1)],
+                )?;
+            }
+            operands.push(operand);
+        }
         let out = b
             .builder
             .concat_with_options(
-                &operands?,
+                &operands,
                 axis as u32,
                 OnnxBuilder::labeled_options(&output_name),
             )
             .map_err(map_op_error)?;
-        Self::record_output(b, node, &output_name, out, context, None)
+        let mut result = Self::record_output(b, node, &output_name, out, context, None)?;
+        if target_rank == Some(1) && axis == 0 {
+            let mut values = Vec::new();
+            let mut all_inputs_const = true;
+            for input in inputs {
+                if let Some(input_values) = Self::const_i64_values(context, input.as_str()) {
+                    values.extend(input_values);
+                } else {
+                    all_inputs_const = false;
+                    break;
+                }
+            }
+            if all_inputs_const {
+                if let Some(output) = node.output.as_slice().first() {
+                    result.const_values.insert(output.to_string(), values);
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Convert ONNX Split to WebNN split
@@ -943,9 +1192,8 @@ impl ReshapeHandler {
             split_values
                 .iter()
                 .map(|&v| {
-                    u32::try_from(v).map_err(|_| {
-                        OnnxError::InvalidShape(format!("invalid split size: {v}"))
-                    })
+                    u32::try_from(v)
+                        .map_err(|_| OnnxError::InvalidShape(format!("invalid split size: {v}")))
                 })
                 .collect::<Result<_, _>>()?
         } else {
@@ -1045,15 +1293,37 @@ impl ReshapeHandler {
             axes_values
         };
 
+        // Negative axes that weren't normalized (unknown rank) are invalid as u32.
+        // Re-normalize against best-effort output rank (axes.len() + known_rank or 0).
+        let known_rank = context.input_rank(inputs[0].as_str()).unwrap_or(0);
+        let output_rank = (known_rank + axes_values.len()) as i64;
+        let axes_u32: Vec<u32> = axes_values
+            .into_iter()
+            .map(|a| {
+                let norm = if a < 0 && output_rank > 0 {
+                    a + output_rank
+                } else {
+                    a
+                };
+                norm.max(0) as u32
+            })
+            .collect();
+
         let opts = MLUnsqueezeOptions {
             label: output_name.clone(),
-            axes: axes_values.into_iter().map(|a| a as u32).collect(),
+            axes: axes_u32,
         };
         let out = b
             .builder
             .unsqueeze_with_options(input0, opts)
             .map_err(map_op_error)?;
-        Self::record_output(b, node, &output_name, out, context, None)
+        let mut result = Self::record_output(b, node, &output_name, out, context, None)?;
+        if let Some(values) = Self::const_i64_values(context, inputs[0].as_str()) {
+            if let Some(output) = node.output.as_slice().first() {
+                result.const_values.insert(output.to_string(), values);
+            }
+        }
+        Ok(result)
     }
 
     /// Convert ONNX Squeeze to WebNN squeeze (emulation)
@@ -1102,7 +1372,13 @@ impl ReshapeHandler {
             .builder
             .squeeze_with_options(input0, opts)
             .map_err(map_op_error)?;
-        Self::record_output(b, node, &output_name, out, context, None)
+        let mut result = Self::record_output(b, node, &output_name, out, context, None)?;
+        if let Some(values) = Self::const_i64_values(context, inputs[0].as_str()) {
+            if let Some(output) = node.output.as_slice().first() {
+                result.const_values.insert(output.to_string(), values);
+            }
+        }
+        Ok(result)
     }
 
     /// Convert ONNX Tile to WebNN tile
@@ -1129,8 +1405,8 @@ impl ReshapeHandler {
         let repeats_name = inputs[1].as_str();
 
         // Try to read repeats from const_values or initializers
-        let repeats = if let Some(vals) = context.const_values.get(repeats_name) {
-            vals.clone()
+        let repeats = if let Some(vals) = Self::const_i64_values(context, repeats_name) {
+            vals
         } else if let Some(tensor) = context.initializers.get(repeats_name) {
             // Read from initializer
             let raw = tensor.raw_data.as_slice();
@@ -1175,18 +1451,13 @@ impl ReshapeHandler {
         let reps_u32: Vec<u32> = repeats
             .iter()
             .map(|&v| {
-                u32::try_from(v).map_err(|_| {
-                    OnnxError::InvalidShape(format!("invalid tile repetition: {v}"))
-                })
+                u32::try_from(v)
+                    .map_err(|_| OnnxError::InvalidShape(format!("invalid tile repetition: {v}")))
             })
             .collect::<Result<_, _>>()?;
         let out = b
             .builder
-            .tile_with_options(
-                input0,
-                reps_u32,
-                OnnxBuilder::labeled_options(&output_name),
-            )
+            .tile_with_options(input0, reps_u32, OnnxBuilder::labeled_options(&output_name))
             .map_err(map_op_error)?;
         Self::record_output(b, node, &output_name, out, context, Some(&inputs[0]))
     }
@@ -1494,6 +1765,35 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_transpose_propagates_const_values() {
+        let handler = ReshapeHandler;
+        let mut node = create_test_node("Transpose", vec!["shape_values"], vec!["transposed"]);
+        add_ints_attribute(&mut node, "perm", vec![1, 0]);
+        let initializers = std::collections::HashMap::new();
+        let mut value_shapes = std::collections::HashMap::new();
+        value_shapes.insert("shape_values".to_string(), vec![2, 2]);
+        let mut const_values = std::collections::HashMap::new();
+        const_values.insert("shape_values".to_string(), vec![1, 2, 3, 4]);
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
+        let context = ConversionContext {
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
+        };
+
+        let result =
+            crate::onnx::ops::convert_handler_with_context(&handler, &node, &context).unwrap();
+        assert_eq!(
+            result.const_values.get("transposed"),
+            Some(&vec![1, 3, 2, 4])
+        );
+    }
+
+    #[test]
     fn test_convert_expand_uses_output_shape_when_shape_input_non_const() {
         let handler = ReshapeHandler;
         let node = create_test_node("Expand", vec!["data", "shape_dyn"], vec!["expanded"]);
@@ -1584,6 +1884,34 @@ mod tests {
         };
 
         crate::onnx::ops::convert_handler_with_context(&handler, &node, &context).unwrap();
+    }
+
+    #[test]
+    fn test_convert_concat_propagates_const_values() {
+        let handler = ReshapeHandler;
+        let mut node = create_test_node("Concat", vec!["a", "b"], vec!["shape"]);
+        add_int_attribute(&mut node, "axis", 0);
+        let initializers = std::collections::HashMap::new();
+        let mut value_shapes = std::collections::HashMap::new();
+        value_shapes.insert("a".to_string(), vec![1]);
+        value_shapes.insert("b".to_string(), vec![1]);
+        let mut const_values = std::collections::HashMap::new();
+        const_values.insert("a".to_string(), vec![2]);
+        const_values.insert("b".to_string(), vec![3]);
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
+        let context = ConversionContext {
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
+        };
+
+        let result =
+            crate::onnx::ops::convert_handler_with_context(&handler, &node, &context).unwrap();
+        assert_eq!(result.const_values.get("shape"), Some(&vec![2, 3]));
     }
 
     #[test]

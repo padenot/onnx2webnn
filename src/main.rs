@@ -8,8 +8,8 @@ use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::path::Path;
 
-use onnx2webnn::{convert_onnx, convert_onnx_save_webnn};
 use onnx2webnn::ConvertOptions;
+use onnx2webnn::{convert_onnx, convert_onnx_save_webnn, convert_onnx_save_webnn_with_reuse};
 
 #[derive(Parser)]
 #[command(name = "onnx2webnn")]
@@ -51,6 +51,12 @@ enum Command {
         /// Output .manifest.json (defaults to <output>.manifest.json)
         #[arg(long)]
         manifest: Option<String>,
+        /// Existing .weights file whose matching tensors may be referenced instead of duplicated
+        #[arg(long = "reuse-weights")]
+        reuse_weights: Option<String>,
+        /// Existing manifest for --reuse-weights
+        #[arg(long = "reuse-manifest")]
+        reuse_manifest: Option<String>,
         /// Also save ORT cache ONNX for fast loading (e.g. model.ort_cache.onnx)
         #[arg(long = "ort-cache")]
         ort_cache: Option<String>,
@@ -58,19 +64,27 @@ enum Command {
         override_dims: Vec<String>,
         #[arg(long)]
         optimize: bool,
+        #[arg(long)]
+        experimental_dynamic_inputs: bool,
     },
 }
 
-fn parse_override_dims(override_dims: Vec<String>, override_dims_file: Option<String>) -> anyhow::Result<HashMap<String, u32>> {
+fn parse_override_dims(
+    override_dims: Vec<String>,
+    override_dims_file: Option<String>,
+) -> anyhow::Result<HashMap<String, u32>> {
     let mut map = if let Some(path) = override_dims_file {
         let content = std::fs::read_to_string(&path)?;
         let json: serde_json::Value = serde_json::from_str(&content)?;
-        let obj = json.get("freeDimensionOverrides").unwrap_or(&json)
+        let obj = json
+            .get("freeDimensionOverrides")
+            .unwrap_or(&json)
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("override-dims-file must be a JSON object"))?;
         obj.iter()
             .map(|(k, v)| {
-                v.as_u64().map(|n| (k.clone(), n as u32))
+                v.as_u64()
+                    .map(|n| (k.clone(), n as u32))
                     .ok_or_else(|| anyhow::anyhow!("override value for '{}' must be integer", k))
             })
             .collect::<Result<HashMap<_, _>, _>>()?
@@ -79,10 +93,15 @@ fn parse_override_dims(override_dims: Vec<String>, override_dims_file: Option<St
     };
 
     for s in override_dims {
-        let (k, v) = s.split_once('=')
+        let (k, v) = s
+            .split_once('=')
             .ok_or_else(|| anyhow::anyhow!("expected NAME=VALUE, got {s:?}"))?;
-        map.insert(k.trim().to_string(), v.trim().parse()
-            .map_err(|_| anyhow::anyhow!("invalid value in {s:?}"))?);
+        map.insert(
+            k.trim().to_string(),
+            v.trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid value in {s:?}"))?,
+        );
     }
     Ok(map)
 }
@@ -94,15 +113,37 @@ fn main() -> anyhow::Result<()> {
     }
 
     match cli.cmd {
-        Command::Convert { input, override_dims, override_dims_file, optimize, experimental_dynamic_inputs } => {
+        Command::Convert {
+            input,
+            override_dims,
+            override_dims_file,
+            optimize,
+            experimental_dynamic_inputs,
+        } => {
             let free_dim_overrides = parse_override_dims(override_dims, override_dims_file)?;
-            let options = ConvertOptions { free_dim_overrides, optimize, experimental_dynamic_inputs, ..Default::default() };
+            let options = ConvertOptions {
+                free_dim_overrides,
+                optimize,
+                experimental_dynamic_inputs,
+                ..Default::default()
+            };
             convert_onnx(Path::new(&input).to_str().unwrap(), options)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             eprintln!("✓ ORT graph build succeeded for {input}");
         }
 
-        Command::Save { input, output, weights, manifest, ort_cache, override_dims, optimize } => {
+        Command::Save {
+            input,
+            output,
+            weights,
+            manifest,
+            reuse_weights,
+            reuse_manifest,
+            ort_cache,
+            override_dims,
+            optimize,
+            experimental_dynamic_inputs,
+        } => {
             let weights_path = weights.unwrap_or_else(|| {
                 let p = Path::new(&output);
                 p.with_extension("weights").to_string_lossy().to_string()
@@ -113,7 +154,12 @@ fn main() -> anyhow::Result<()> {
             });
 
             let free_dim_overrides = parse_override_dims(override_dims, None)?;
-            let options = ConvertOptions { free_dim_overrides, optimize, ..Default::default() };
+            let options = ConvertOptions {
+                free_dim_overrides,
+                optimize,
+                experimental_dynamic_inputs,
+                ..Default::default()
+            };
 
             // Ensure the output file uses .json extension (load_graph_from_path requires .webnn or .json)
             let output_path = if !output.ends_with(".json") && !output.ends_with(".webnn") {
@@ -122,8 +168,33 @@ fn main() -> anyhow::Result<()> {
                 output.clone()
             };
 
-            convert_onnx_save_webnn(Path::new(&input).to_str().unwrap(), options.clone(), &output_path, &weights_path, &manifest_path)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            match (reuse_weights, reuse_manifest) {
+                (Some(reuse_weights), Some(reuse_manifest)) => {
+                    let source = webnn_graph::weights_io::ReusableWeightsSource {
+                        weights_file: reuse_weights,
+                        manifest_file: reuse_manifest,
+                    };
+                    convert_onnx_save_webnn_with_reuse(
+                        Path::new(&input).to_str().unwrap(),
+                        options.clone(),
+                        &output_path,
+                        &weights_path,
+                        &manifest_path,
+                        &[source],
+                    )
+                }
+                (None, None) => convert_onnx_save_webnn(
+                    Path::new(&input).to_str().unwrap(),
+                    options.clone(),
+                    &output_path,
+                    &weights_path,
+                    &manifest_path,
+                ),
+                _ => Err(onnx2webnn::OnnxError::ShapeInference(
+                    "--reuse-weights and --reuse-manifest must be passed together".to_string(),
+                )),
+            }
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
             eprintln!("✓ WebNN graph: {output_path}");
             eprintln!("✓ Weights:     {weights_path}");

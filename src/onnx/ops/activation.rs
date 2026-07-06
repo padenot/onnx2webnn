@@ -59,7 +59,8 @@ impl OpHandler for ActivationHandler {
         let node_name = if !node.name.is_empty() {
             node.name.as_str().to_string()
         } else {
-            node.output.first()
+            node.output
+                .first()
                 .map(|s| crate::onnx::convert::sanitize_identifier(s))
                 .unwrap_or_else(|| node.op_type.to_string())
         };
@@ -139,24 +140,66 @@ fn emit_unary(
     node_name: &str,
 ) -> Result<MLOperand, OnnxError> {
     Ok(match webnn_op {
-        "relu" => b.builder.relu_with_options(input, opts).map_err(map_op_error)?,
-        "gelu" => b.builder.gelu_with_options(input, opts).map_err(map_op_error)?,
-        "tanh" => b.builder.tanh_with_options(input, opts).map_err(map_op_error)?,
+        "relu" => b
+            .builder
+            .relu_with_options(input, opts)
+            .map_err(map_op_error)?,
+        "gelu" => b
+            .builder
+            .gelu_with_options(input, opts)
+            .map_err(map_op_error)?,
+        "tanh" => b
+            .builder
+            .tanh_with_options(input, opts)
+            .map_err(map_op_error)?,
         "sigmoid" => b
             .builder
             .sigmoid_with_options(input, opts)
             .map_err(map_op_error)?,
-        "sqrt" => b.builder.sqrt_with_options(input, opts).map_err(map_op_error)?,
-        "exp" => b.builder.exp_with_options(input, opts).map_err(map_op_error)?,
-        "log" => b.builder.log_with_options(input, opts).map_err(map_op_error)?,
-        "abs" => b.builder.abs_with_options(input, opts).map_err(map_op_error)?,
-        "neg" => b.builder.neg_with_options(input, opts).map_err(map_op_error)?,
-        "erf" => b.builder.erf_with_options(input, opts).map_err(map_op_error)?,
-        "cos" => b.builder.cos_with_options(input, opts).map_err(map_op_error)?,
-        "sin" => b.builder.sin_with_options(input, opts).map_err(map_op_error)?,
-        "floor" => b.builder.floor_with_options(input, opts).map_err(map_op_error)?,
-        "ceil" => b.builder.ceil_with_options(input, opts).map_err(map_op_error)?,
-        "round" => b.builder.round_even_with_options(input, opts).map_err(map_op_error)?,
+        "sqrt" => b
+            .builder
+            .sqrt_with_options(input, opts)
+            .map_err(map_op_error)?,
+        "exp" => b
+            .builder
+            .exp_with_options(input, opts)
+            .map_err(map_op_error)?,
+        "log" => b
+            .builder
+            .log_with_options(input, opts)
+            .map_err(map_op_error)?,
+        "abs" => b
+            .builder
+            .abs_with_options(input, opts)
+            .map_err(map_op_error)?,
+        "neg" => b
+            .builder
+            .neg_with_options(input, opts)
+            .map_err(map_op_error)?,
+        "erf" => b
+            .builder
+            .erf_with_options(input, opts)
+            .map_err(map_op_error)?,
+        "cos" => b
+            .builder
+            .cos_with_options(input, opts)
+            .map_err(map_op_error)?,
+        "sin" => b
+            .builder
+            .sin_with_options(input, opts)
+            .map_err(map_op_error)?,
+        "floor" => b
+            .builder
+            .floor_with_options(input, opts)
+            .map_err(map_op_error)?,
+        "ceil" => b
+            .builder
+            .ceil_with_options(input, opts)
+            .map_err(map_op_error)?,
+        "round" => b
+            .builder
+            .round_even_with_options(input, opts)
+            .map_err(map_op_error)?,
         "identity" => b
             .builder
             .identity_with_options(input, opts)

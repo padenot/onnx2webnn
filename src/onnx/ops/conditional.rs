@@ -28,7 +28,8 @@ impl OpHandler for ConditionalHandler {
         let node_name = if !node.name.is_empty() {
             node.name.clone()
         } else {
-            node.output.first()
+            node.output
+                .first()
                 .map(|s| crate::onnx::convert::sanitize_identifier(s))
                 .unwrap_or_else(|| node.op_type.to_string())
         };
@@ -70,8 +71,8 @@ impl OpHandler for ConditionalHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustnn::DataType;
     use crate::protos::onnx::NodeProto;
+    use rustnn::DataType;
     use std::collections::HashMap;
 
     fn create_test_node(op_type: &str, inputs: Vec<&str>, outputs: Vec<&str>) -> NodeProto {

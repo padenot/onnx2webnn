@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use rustnn::DataType;
 use crate::onnx::builder::{map_op_error, OnnxBuilder};
 use crate::onnx::builder_helpers::{output_label, record_node_output};
 use crate::onnx::convert::OnnxError;
@@ -95,8 +94,8 @@ impl OpHandler for ScatterHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustnn::DataType;
     use crate::protos::onnx::{AttributeProto, NodeProto, TensorProto};
+    use rustnn::DataType;
 
     fn create_test_node(op_type: &str, inputs: Vec<&str>, outputs: Vec<&str>) -> NodeProto {
         NodeProto {
@@ -159,8 +158,7 @@ mod tests {
         let node = create_test_node("ScatterND", vec!["data", "indices", "updates"], vec!["y"]);
         let mut tc = TestContext::new();
         tc.value_shapes.insert("data".to_string(), vec![2, 3]);
-        tc.value_shapes
-            .insert("indices".to_string(), vec![2, 1]);
+        tc.value_shapes.insert("indices".to_string(), vec![2, 1]);
         tc.value_shapes.insert("updates".to_string(), vec![2, 3]);
         tc.value_types.insert("data".to_string(), DataType::Float32);
         let result =

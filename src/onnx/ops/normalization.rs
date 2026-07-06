@@ -32,7 +32,8 @@ impl OpHandler for NormalizationHandler {
         let node_name = if !node.name.is_empty() {
             node.name.clone()
         } else {
-            node.output.first()
+            node.output
+                .first()
                 .map(|s| crate::onnx::convert::sanitize_identifier(s))
                 .unwrap_or_else(|| node.op_type.to_string())
         };
@@ -200,7 +201,8 @@ mod tests {
     #[test]
     fn test_convert_layer_norm() {
         let handler = NormalizationHandler;
-        let mut node = create_test_node("LayerNormalization", vec!["x", "scale", "bias"], vec!["y"]);
+        let mut node =
+            create_test_node("LayerNormalization", vec!["x", "scale", "bias"], vec!["y"]);
         add_float_attribute(&mut node, "epsilon", 1e-5);
         add_int_attribute(&mut node, "axis", -1);
         crate::onnx::ops::convert_with_test_builder(&handler, &node).unwrap();

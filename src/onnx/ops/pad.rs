@@ -46,7 +46,8 @@ impl OpHandler for PadHandler {
         let node_name = if !node.name.is_empty() {
             node.name.clone()
         } else {
-            node.output.first()
+            node.output
+                .first()
                 .map(|s| crate::onnx::convert::sanitize_identifier(s))
                 .unwrap_or_else(|| node.op_type.to_string())
         };
@@ -71,8 +72,49 @@ impl PadHandler {
 
         let output_name = output_label(node, node_name);
         let input0 = b.resolve_operand(&inputs[0])?;
+        let input_shape = context.resolve_shape(&inputs[0]).cloned().or_else(|| {
+            b.builder
+                .rustnn_operand_shape(input0)
+                .ok()
+                .map(|shape| shape.iter().map(|&dim| dim as i64).collect())
+        });
+
+        // Try to determine rank from the context; fall back to inferring from the pads tensor
+        // (pads length = 2 * rank) when the input's shape isn't tracked (intermediate tensor).
         let rank = context
             .input_rank(&inputs[0])
+            // Try the builder's known operand shape
+            .or_else(|| b.builder.rustnn_operand_shape(input0).ok().map(|s| s.len()))
+            .or_else(|| {
+                // Read the raw pads to infer rank (pads length = 2 * rank)
+                if inputs.len() >= 2 {
+                    if let Some(vals) = context.const_values.get(&inputs[1]) {
+                        return Some(vals.len() / 2);
+                    }
+                    if let Some(t) = context.initializers.get(inputs[1].as_str()) {
+                        let n = if !t.raw_data.is_empty() {
+                            let elem_size = if t.data_type
+                                == crate::protos::onnx::TensorProto_DataType::Int32 as i32
+                            {
+                                4
+                            } else {
+                                8
+                            };
+                            t.raw_data.len() / elem_size
+                        } else {
+                            t.int64_data.len().max(t.int32_data.len())
+                        };
+                        return Some(n / 2);
+                    }
+                }
+                // Attribute pads: length = 2 * rank
+                for attr in node.attribute.as_slice() {
+                    if attr.name.as_str() == "pads" && !attr.ints.is_empty() {
+                        return Some(attr.ints.len() / 2);
+                    }
+                }
+                None
+            })
             .ok_or_else(|| OnnxError::InvalidShape("Pad requires known input rank".to_string()))?;
 
         let onnx_pads = read_onnx_pads(node, context, rank)?;
@@ -106,6 +148,17 @@ impl PadHandler {
             if let Some(dtype) = context.value_types.get(&inputs[0]) {
                 result.output_types.insert(onnx_out.clone(), dtype.clone());
             }
+            if let Some(shape) = input_shape
+                .as_deref()
+                .and_then(|shape| infer_pad_output_shape(shape, &onnx_pads))
+            {
+                result.output_shapes.insert(onnx_out.clone(), shape);
+            } else if let Ok(shape) = b.builder.rustnn_operand_shape(out) {
+                result.output_shapes.insert(
+                    onnx_out.clone(),
+                    shape.iter().map(|&dim| dim as i64).collect(),
+                );
+            }
         }
         Ok(result)
     }
@@ -116,12 +169,7 @@ pub fn read_onnx_pads(
     context: &ConversionContext,
     rank: usize,
 ) -> Result<Vec<i64>, OnnxError> {
-    read_onnx_pads_from_maps(
-        node,
-        context.initializers,
-        context.const_values,
-        rank,
-    )
+    read_onnx_pads_from_maps(node, context.initializers, context.const_values, rank)
 }
 
 pub fn read_onnx_pads_from_maps(
@@ -184,7 +232,9 @@ pub fn infer_pad_output_shape(input_shape: &[i64], pads: &[i64]) -> Option<Vec<i
     }
     let mut out = input_shape.to_vec();
     for i in 0..rank {
-        out[i] = out[i].saturating_add(pads[i]).saturating_add(pads[i + rank]);
+        out[i] = out[i]
+            .saturating_add(pads[i])
+            .saturating_add(pads[i + rank]);
     }
     Some(out)
 }
@@ -262,9 +312,7 @@ fn read_int64_tensor_proto(t: &TensorProto) -> Option<Vec<i64>> {
         return Some(
             t.raw_data
                 .chunks_exact(8)
-                .map(|c| {
-                    i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
-                })
+                .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
                 .collect(),
         );
     }
@@ -282,7 +330,11 @@ mod tests {
     use super::*;
     use crate::protos::onnx::NodeProto;
 
-    fn create_test_node(inputs: Vec<&str>, outputs: Vec<&str>, attrs: Vec<(&str, Vec<i64>)>) -> NodeProto {
+    fn create_test_node(
+        inputs: Vec<&str>,
+        outputs: Vec<&str>,
+        attrs: Vec<(&str, Vec<i64>)>,
+    ) -> NodeProto {
         NodeProto {
             op_type: "Pad".to_string(),
             name: "test_pad".to_string(),

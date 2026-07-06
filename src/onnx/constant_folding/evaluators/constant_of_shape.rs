@@ -107,6 +107,20 @@ impl EvaluatorTrait for ConstantOfShapeEvaluator {
                                 fill_value_f32 = value_tensor.float_data.as_slice()[0];
                             }
                         }
+                        x if x == TensorProto_DataType::Bool as i32 => {
+                            let raw = value_tensor.raw_data.as_slice();
+                            if let Some(&value) = raw.first() {
+                                fill_value_i64 = i64::from(value != 0);
+                            } else if let Some(&value) = value_tensor.int32_data.as_slice().first()
+                            {
+                                fill_value_i64 = i64::from(value != 0);
+                            } else if let Some(&value) = value_tensor.int64_data.as_slice().first()
+                            {
+                                fill_value_i64 = i64::from(value != 0);
+                            } else {
+                                fill_value_i64 = 0;
+                            }
+                        }
                         _ => {
                             return Err(OnnxError::ShapeInference(format!(
                                 "Unsupported data type for ConstantOfShape value: {:?}",
@@ -141,6 +155,11 @@ impl EvaluatorTrait for ConstantOfShapeEvaluator {
             },
             x if x == TensorProto_DataType::Float as i32 => ConstantTensor {
                 data: TensorData::Float32(vec![fill_value_f32; numel as usize]),
+                shape: shape_values,
+                data_type,
+            },
+            x if x == TensorProto_DataType::Bool as i32 => ConstantTensor {
+                data: TensorData::UInt8(vec![u8::from(fill_value_i64 != 0); numel as usize]),
                 shape: shape_values,
                 data_type,
             },

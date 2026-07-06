@@ -30,7 +30,8 @@ impl OpHandler for MatMulHandler {
         let node_name = if !node.name.is_empty() {
             node.name.clone()
         } else {
-            node.output.first()
+            node.output
+                .first()
                 .map(|s| crate::onnx::convert::sanitize_identifier(s))
                 .unwrap_or_else(|| node.op_type.to_string())
         };

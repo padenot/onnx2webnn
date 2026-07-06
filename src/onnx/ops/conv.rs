@@ -42,6 +42,7 @@ use crate::onnx::builder_helpers::{
 };
 use crate::onnx::convert::{sanitize_identifier, OnnxError};
 use crate::onnx::ops::{ConversionContext, ConversionResult, OpHandler};
+use crate::onnx::shape_inference::{static_shape_from_dims, value_shape_dims_for};
 use crate::protos::onnx::NodeProto;
 use rustnn::operator_options::{MLConv2dOptions, MLConvTranspose2dOptions};
 
@@ -62,7 +63,8 @@ impl OpHandler for ConvHandler {
         let node_name = if !node.name.is_empty() {
             node.name.as_str().to_string()
         } else {
-            node.output.first()
+            node.output
+                .first()
                 .map(|s| crate::onnx::convert::sanitize_identifier(s))
                 .unwrap_or_else(|| node.op_type.to_string())
         };
@@ -140,12 +142,13 @@ pub(super) fn parse_conv_attrs(node: &NodeProto) -> ConvAttrs {
 }
 
 fn lookup_shape(name: &str, context: &ConversionContext) -> Option<Vec<i64>> {
-    if let Some(s) = context.value_shapes.get(name) {
+    if let Some(s) = context.resolve_shape(name) {
         return Some(s.clone());
     }
-    let sanitized = sanitize_identifier(name);
-    if let Some(s) = context.value_shapes.get(&sanitized) {
-        return Some(s.clone());
+    if let Some(dims) = value_shape_dims_for(name, context.value_shape_dims) {
+        if let Some(shape) = static_shape_from_dims(dims) {
+            return Some(shape);
+        }
     }
     if let Some(init) = context.initializers.get(name) {
         return Some(init.dims.as_slice().to_vec());
@@ -176,14 +179,21 @@ fn i64_vec_to_u32(values: &[i64]) -> Result<Vec<u32>, OnnxError> {
         .collect()
 }
 
-pub(super) fn build_conv2d_options(attrs: &ConvAttrs, label: &str) -> Result<MLConv2dOptions, OnnxError> {
+pub(super) fn build_conv2d_options(
+    attrs: &ConvAttrs,
+    label: &str,
+) -> Result<MLConv2dOptions, OnnxError> {
     // Extend 1D attrs to 2D by appending 1 (treats the second spatial dim as size-1).
     let extend2 = |v: Vec<i64>| if v.len() == 1 { vec![v[0], 1] } else { v };
     let strides = extend2(attrs.strides.clone().unwrap_or_else(|| vec![1, 1]));
     let dilations = extend2(attrs.dilations.clone().unwrap_or_else(|| vec![1, 1]));
     let pads = {
         let p = attrs.pads.clone().unwrap_or_else(|| vec![0, 0, 0, 0]);
-        if p.len() == 2 { vec![p[0], 0, p[1], 0] } else { p }
+        if p.len() == 2 {
+            vec![p[0], 0, p[1], 0]
+        } else {
+            p
+        }
     };
 
     if strides.len() != 2 {
@@ -428,7 +438,16 @@ impl ConvHandler {
         } else {
             b.record_operand(&[output_name], out);
         }
-        Ok(ConversionResult::default())
+        let mut result = ConversionResult::default();
+        if let Some(onnx_out) = node.output.first() {
+            if let Ok(shape) = b.builder.rustnn_operand_shape(out) {
+                result.output_shapes.insert(
+                    onnx_out.clone(),
+                    shape.iter().map(|&dim| dim as i64).collect(),
+                );
+            }
+        }
+        Ok(result)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -482,18 +501,8 @@ impl ConvHandler {
         let reshape_w_label = sanitize_identifier(&format!("{node_name}_w4d"));
         let conv_label = sanitize_identifier(&format!("{node_name}_conv2d"));
 
-        let in_4d = i64_slice_to_mldim(&[
-            input_shape[0],
-            input_shape[1],
-            input_shape[2],
-            1,
-        ])?;
-        let w_4d = i64_slice_to_mldim(&[
-            filter_shape[0],
-            filter_shape[1],
-            filter_shape[2],
-            1,
-        ])?;
+        let in_4d = i64_slice_to_mldim(&[input_shape[0], input_shape[1], input_shape[2], 1])?;
+        let w_4d = i64_slice_to_mldim(&[filter_shape[0], filter_shape[1], filter_shape[2], 1])?;
 
         let input = b.resolve_operand(input_raw)?;
         let filter = b.resolve_operand(filter_raw)?;
@@ -510,11 +519,7 @@ impl ConvHandler {
 
         let w4d = b
             .builder
-            .reshape_with_options(
-                filter,
-                w_4d,
-                OnnxBuilder::labeled_options(&reshape_w_label),
-            )
+            .reshape_with_options(filter, w_4d, OnnxBuilder::labeled_options(&reshape_w_label))
             .map_err(map_op_error)?;
         b.record_operand(&[&reshape_w_label], w4d);
 
@@ -555,11 +560,7 @@ impl ConvHandler {
         let out_3d = i64_slice_to_mldim(&[input_shape[0], filter_shape[0], spatial_out])?;
         let final_out = b
             .builder
-            .reshape_with_options(
-                conv_out,
-                out_3d,
-                OnnxBuilder::labeled_options(output_name),
-            )
+            .reshape_with_options(conv_out, out_3d, OnnxBuilder::labeled_options(output_name))
             .map_err(map_op_error)?;
 
         if let Some(onnx_out) = node.output.first() {
@@ -567,7 +568,14 @@ impl ConvHandler {
         } else {
             b.record_operand(&[output_name], final_out);
         }
-        Ok(ConversionResult::default())
+        let mut result = ConversionResult::default();
+        if let Some(onnx_out) = node.output.first() {
+            result.output_shapes.insert(
+                onnx_out.clone(),
+                vec![input_shape[0], filter_shape[0], spatial_out],
+            );
+        }
+        Ok(result)
     }
 }
 

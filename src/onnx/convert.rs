@@ -18,16 +18,18 @@
 
 // Main ONNX to WebNN conversion logic
 
-use rustnn::DataType; use rustnn::graph::{Dimension, DynamicDimension};
 use crate::onnx::builder::{map_rustnn_error, tensor_proto_to_bytes, OnnxBuilder};
+use crate::onnx::shape_inference::static_shape_from_dims;
 use crate::protos::onnx::{
     tensor_shape_proto::dimension::Value as DimensionValue, type_proto::Value as TypeProtoValue,
     ModelProto, TensorProto_DataType,
 };
 use prost::Message;
+use rustnn::graph::{Dimension, DynamicDimension};
 use rustnn::mlcontext::{
     MLContext, MLContextOptions, MLGraph, MLGraphBuilder, MLOperand, MLPowerPreference,
 };
+use rustnn::DataType;
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -59,14 +61,15 @@ impl<'ctx> ValidatedGraph<'ctx> {
             std::collections::HashMap::new();
         for (name, (data, shape)) in &inputs {
             // Determine the declared data type for this input.
-            let dtype = input_descs.get(name.as_str())
+            let dtype = input_descs
+                .get(name.as_str())
                 .map(|d| {
                     use rustnn::graph::DataType;
                     match d.data_type {
-                        DataType::Int64  => DT::Int64,
-                        DataType::Int32  => DT::Int32,
-                        DataType::Uint8  => DT::Uint8,
-                        _                => DT::Float32,
+                        DataType::Int64 => DT::Int64,
+                        DataType::Int32 => DT::Int32,
+                        DataType::Uint8 => DT::Uint8,
+                        _ => DT::Float32,
                     }
                 })
                 .unwrap_or(DT::Float32);
@@ -106,7 +109,7 @@ impl<'ctx> ValidatedGraph<'ctx> {
                 .iter()
                 .map(|d| rustnn::graph::get_static_or_max_size(d) as u64)
                 .collect();
-            // Use Float32 — the parakeet output is f32.
+            // Use Float32 for the current dispatch readback path.
             let mut tdesc = MLTensorDescriptor::new(DT::Float32, shape);
             tdesc.set_readable(true);
             let tensor = self
@@ -121,7 +124,10 @@ impl<'ctx> ValidatedGraph<'ctx> {
             let input_refs: std::collections::HashMap<&str, &rustnn::mlcontext::MLTensor> =
                 input_tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
             let output_refs: std::collections::HashMap<&str, &rustnn::mlcontext::MLTensor> =
-                output_tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
+                output_tensors
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v))
+                    .collect();
             self.context
                 .dispatch(&mut self.graph, &input_refs, &output_refs)
                 .map_err(|e| OnnxError::ShapeInference(format!("dispatch failed: {e}")))?;
@@ -139,7 +145,10 @@ impl<'ctx> ValidatedGraph<'ctx> {
             let mut buf = vec![0f32; n_elems];
             if let Some(tensor) = output_tensors.get(name) {
                 self.context
-                    .read_tensor(tensor, bytemuck::cast_slice_mut::<f32, u8>(buf.as_mut_slice()))
+                    .read_tensor(
+                        tensor,
+                        bytemuck::cast_slice_mut::<f32, u8>(buf.as_mut_slice()),
+                    )
                     .map_err(|e| OnnxError::ShapeInference(format!("read tensor: {e}")))?;
             }
             results.insert(name.clone(), (buf, shape));
@@ -409,6 +418,12 @@ impl OnnxConverter {
                     overrides.insert(dim_param.to_string(), *v);
                     return Some(*v);
                 }
+                // Try evaluating as an arithmetic expression (e.g. ONNX subsampling formulas
+                // like "(((sequence_length - 1)//2)) + 1" that reference known overrides).
+                if let Some(v) = eval_dim_param_expr(dim_param, overrides) {
+                    overrides.insert(dim_param.to_string(), v);
+                    return Some(v);
+                }
                 None
             };
 
@@ -457,10 +472,15 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                                         }
                                     }
                                     DimensionValue::DimParam(dim_param) => {
-                                        if let Some(v) = resolve_dim_override(
+                                        crate::debug_println!(
+                                            "input '{}' dim_param={:?} overrides={:?}",
+                                            raw_name,
                                             dim_param,
-                                            &effective_overrides,
-                                        ) {
+                                            effective_overrides
+                                        );
+                                        if let Some(v) =
+                                            resolve_dim_override(dim_param, &effective_overrides)
+                                        {
                                             resolved.push(Dimension::Static(v));
                                         } else if options.experimental_dynamic_inputs {
                                             let max_size = dynamic_max_for_dim(dim_param);
@@ -548,7 +568,21 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                 .collect();
 
             let bytes = tensor_proto_to_bytes(initializer)?;
-            b.register_constant_from_bytes(initializer.name.as_str(), data_type.clone(), &shape, &bytes)?;
+            b.register_constant_from_bytes(
+                initializer.name.as_str(),
+                data_type.clone(),
+                &shape,
+                &bytes,
+            )
+            .map_err(|e| {
+                OnnxError::InvalidShape(format!(
+                    "initializer '{}' dtype {:?} shape {:?} bytes {}: {e}",
+                    initializer.name,
+                    data_type,
+                    shape,
+                    bytes.len()
+                ))
+            })?;
 
             value_name_map.insert(initializer.name.as_str().to_string(), name.clone());
             value_name_map.insert(name.clone(), name.clone());
@@ -615,8 +649,10 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                                                         dim_param,
                                                         &inference_overrides,
                                                     )
-                                                    .unwrap_or_else(|| dynamic_max_for_dim(dim_param))
-                                                    as i64,
+                                                    .unwrap_or_else(|| {
+                                                        dynamic_max_for_dim(dim_param)
+                                                    })
+                                                        as i64,
                                                 );
                                             } else if let Some(v) = resolve_dim_for_inference(
                                                 dim_param,
@@ -646,11 +682,16 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                                     match dim_value {
                                         DimensionValue::DimValue(v) => {
                                             if *v > 0 {
-                                                dims.push(rustnn::graph::Dimension::Static(*v as u32));
+                                                dims.push(rustnn::graph::Dimension::Static(
+                                                    *v as u32,
+                                                ));
                                             }
                                         }
                                         DimensionValue::DimParam(dim_param) => {
-                                            dims.push(dimension_for_param(dim_param, &inference_overrides));
+                                            dims.push(dimension_for_param(
+                                                dim_param,
+                                                &inference_overrides,
+                                            ));
                                         }
                                     }
                                 }
@@ -716,8 +757,11 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                                     DimensionValue::DimParam(dim_param) => {
                                         if options.experimental_dynamic_inputs {
                                             shape.push(
-                                                resolve_dim_override(dim_param, &inference_overrides)
-                                                    .unwrap_or_else(|| dynamic_max_for_dim(dim_param))
+                                                resolve_dim_override(
+                                                    dim_param,
+                                                    &inference_overrides,
+                                                )
+                                                .unwrap_or_else(|| dynamic_max_for_dim(dim_param))
                                                     as i64,
                                             );
                                         } else if let Some(v) = resolve_dim_for_inference(
@@ -752,7 +796,10 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                                         }
                                     }
                                     DimensionValue::DimParam(dim_param) => {
-                                        dims.push(dimension_for_param(dim_param, &inference_overrides));
+                                        dims.push(dimension_for_param(
+                                            dim_param,
+                                            &inference_overrides,
+                                        ));
                                     }
                                 }
                             }
@@ -764,7 +811,6 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                 }
             }
         }
-
         // Seed const values with integer initializers and Constant nodes
         let mut const_values: HashMap<String, Vec<i64>> = HashMap::new();
         for (name, initializer) in &initializers_map {
@@ -802,7 +848,6 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                 }
             }
         }
-
         for node in onnx_graph.node.as_slice() {
             if node.op_type.as_str() == "Constant" {
                 if let Some(attr) = node
@@ -895,18 +940,6 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                     for (k, v) in inferred.const_values {
                         // Use insert() instead of or_insert() to allow shape inference to correct
                         // earlier wrong values (e.g., Where operation heuristics)
-                        if k.contains("rotary") && k.contains("Where") {
-                            if let Some(old_val) = const_values.get(&k) {
-                                crate::debug_println!(
-                                    "[CONVERT] Overwriting {} from {:?} to {:?}",
-                                    k,
-                                    old_val,
-                                    v
-                                );
-                            } else {
-                                crate::debug_println!("[CONVERT] Inserting new {} = {:?}", k, v);
-                            }
-                        }
                         const_values.insert(k, v);
                     }
                     break;
@@ -954,10 +987,41 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                 experimental_dynamic_inputs: options.experimental_dynamic_inputs,
             },
         );
-
-        // DEBUG: Check value before node conversion
-        if let Some(val) = const_values.get("/model/rotary_emb/Where_output_0") {
-            crate::debug_println!("[NODE CONV] /model/rotary_emb/Where_output_0 = {:?}", val);
+        let restored_shapes: Vec<(String, Vec<i64>)> = value_shape_dims
+            .iter()
+            .filter_map(|(name, dims)| {
+                if value_shapes.contains_key(name) {
+                    None
+                } else {
+                    static_shape_from_dims(dims).map(|shape| (name.clone(), shape))
+                }
+            })
+            .collect();
+        for (name, shape) in restored_shapes {
+            value_shapes.insert(name.clone(), shape.clone());
+            value_shapes.insert(sanitize_identifier(&name), shape);
+        }
+        let restored_shape_dims: Vec<(String, Vec<Dimension>)> = value_shapes
+            .iter()
+            .filter_map(|(name, shape)| {
+                if value_shape_dims.contains_key(name) {
+                    None
+                } else if shape.iter().all(|&dim| dim > 0) {
+                    Some((
+                        name.clone(),
+                        shape
+                            .iter()
+                            .map(|&dim| Dimension::Static(dim as u32))
+                            .collect(),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (name, dims) in restored_shape_dims {
+            value_shape_dims.insert(name.clone(), dims.clone());
+            value_shape_dims.insert(sanitize_identifier(&name), dims);
         }
         for onnx_node in onnx_graph.node.as_slice() {
             // If all outputs are compile-time constants, emit them directly and skip conversion
@@ -970,6 +1034,7 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
             if !outputs.is_empty()
                 && !has_dynamic_output_metadata
                 && onnx_node.op_type.as_str() != "Cast"
+                && onnx_node.op_type.as_str() != "Shape"
                 && onnx_node.op_type.as_str() != "ConstantOfShape"
                 && !is_element_wise_logical_onnx_op(onnx_node.op_type.as_str())
                 && outputs
@@ -1046,7 +1111,12 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                         }
 
                         let shape_u32: Vec<u32> = shape.iter().map(|d| *d as u32).collect();
-                        b.register_constant_from_bytes(&const_name, dtype.clone(), &shape_u32, &bytes)?;
+                        b.register_constant_from_bytes(
+                            &const_name,
+                            dtype.clone(),
+                            &shape_u32,
+                            &bytes,
+                        )?;
 
                         value_name_map.insert(out.to_string(), const_name.clone());
                         value_name_map.insert(const_name.clone(), const_name.clone());
@@ -1055,6 +1125,24 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                     }
                 }
                 continue;
+            }
+
+            // Pre-infer this node's output shape BEFORE conversion so that
+            // handlers can use it for size-capping (e.g. Slice without const ends).
+            if let Some(pre_inferred) = crate::onnx::shape_inference::infer_node_output_shape(
+                onnx_node,
+                &value_shapes,
+                &initializers_map,
+                &const_values,
+            ) {
+                for output_name in onnx_node.output.as_slice() {
+                    value_shapes
+                        .entry(output_name.to_string())
+                        .or_insert_with(|| pre_inferred.clone());
+                    value_shapes
+                        .entry(sanitize_identifier(output_name))
+                        .or_insert_with(|| pre_inferred.clone());
+                }
             }
 
             let context = crate::onnx::ops::ConversionContext {
@@ -1073,28 +1161,199 @@ Provide --override-dim {}=<value> or enable --experimental-dynamic-inputs.",
                 value_name_map.insert(onnx_out.clone(), webnn_id.clone());
                 value_types.insert(webnn_id, dtype);
             }
+            for (onnx_out, shape) in converted.output_shapes {
+                value_shapes.insert(onnx_out.clone(), shape.clone());
+                value_shapes.insert(sanitize_identifier(&onnx_out), shape);
+            }
+            let mut converted_const_changed = false;
+            for (onnx_out, values) in converted.const_values {
+                if crate::onnx::shape_inference::insert_folded_const_value(
+                    onnx_graph,
+                    &mut const_values,
+                    &onnx_out,
+                    values.clone(),
+                ) {
+                    converted_const_changed = true;
+                }
+                const_values.insert(sanitize_identifier(&onnx_out), values);
+            }
+            if converted_const_changed {
+                crate::onnx::shape_inference::propagate_shapes_and_fold_constants(
+                    onnx_graph,
+                    &initializers_map,
+                    &mut value_shapes,
+                    &mut value_types,
+                    &mut const_values,
+                    &mut value_shape_dims,
+                    &crate::onnx::shape_inference::PropagateOptions {
+                        optimize: options.optimize,
+                        experimental_dynamic_inputs: options.experimental_dynamic_inputs,
+                    },
+                );
+            }
 
             // Track output shapes after conversion to prevent shape inflation
             // Use .insert() to force correct shapes (not .or_insert() which preserves old shapes)
-            if let Some(inferred_shape) =
-                crate::onnx::shape_inference::infer_node_output_shape(
-                    onnx_node,
-                    &value_shapes,
-                    &initializers_map,
-                    &const_values,
-                )
-            {
+            if let Some(inferred_shape) = crate::onnx::shape_inference::infer_node_output_shape(
+                onnx_node,
+                &value_shapes,
+                &initializers_map,
+                &const_values,
+            ) {
                 for output_name in onnx_node.output.as_slice() {
                     // Insert shape for both raw and sanitized names
                     value_shapes.insert(output_name.to_string(), inferred_shape.clone());
                     value_shapes.insert(sanitize_identifier(output_name), inferred_shape.clone());
                 }
             }
-
         }
 
         Ok(())
     }
+}
+
+/// Evaluate a simple arithmetic expression that may appear as an ONNX dim_param.
+/// Handles integer literals, identifier lookups, parentheses, and +/-/*///
+/// operators. This allows resolving ONNX shape annotations like
+/// `(((sequence_length - 1)//2)) + 1` when the base overrides are known.
+fn eval_dim_param_expr(s: &str, overrides: &HashMap<String, u32>) -> Option<u32> {
+    // Strip whitespace
+    let trimmed: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    let expr = trimmed.as_str();
+
+    // Handle Max(a, b) and Min(a, b) function calls
+    for func in &["Max(", "Min("] {
+        if expr.starts_with(func) && expr.ends_with(')') {
+            let inner = &expr[func.len()..expr.len() - 1];
+            // Split at the top-level comma
+            let mut depth = 0i32;
+            let mut split = None;
+            for (i, &b) in inner.as_bytes().iter().enumerate() {
+                match b {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    b',' if depth == 0 => {
+                        split = Some(i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(pos) = split {
+                let a = eval_dim_param_expr(&inner[..pos], overrides)?;
+                let b = eval_dim_param_expr(&inner[pos + 1..], overrides)?;
+                return Some(if func == &"Max(" { a.max(b) } else { a.min(b) });
+            }
+        }
+    }
+
+    // Integer literal
+    if let Ok(v) = expr.parse::<i64>() {
+        return if v >= 0 { Some(v as u32) } else { None };
+    }
+
+    // Direct identifier lookup
+    if let Some(&v) = overrides.get(expr) {
+        return Some(v);
+    }
+
+    // Strip matching outer parentheses iteratively
+    let mut cur = expr;
+    loop {
+        if cur.starts_with('(') && cur.ends_with(')') {
+            let bytes = cur.as_bytes();
+            let mut depth = 0usize;
+            let mut matched = false;
+            for (i, &b) in bytes.iter().enumerate() {
+                match b {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            matched = i == bytes.len() - 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if matched {
+                cur = &cur[1..cur.len() - 1];
+                continue;
+            }
+        }
+        break;
+    }
+
+    if cur != expr {
+        // Outer parens were stripped; recurse on the inner expression
+        return eval_dim_param_expr(cur, overrides);
+    }
+
+    // Find the rightmost top-level additive operator (+/-), then multiplicative (*, /, //)
+    // Rightmost gives correct left-associativity when recursing on the LHS.
+    let bytes = cur.as_bytes();
+    let mut depth = 0i32;
+    let mut last_add: Option<(usize, u8)> = None;
+    let mut last_mul: Option<(usize, &str)> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'+' if depth == 0 && i > 0 => last_add = Some((i, b'+')),
+            b'-' if depth == 0 && i > 0 => last_add = Some((i, b'-')),
+            b'*' if depth == 0 => last_mul = Some((i, "*")),
+            b'/' if depth == 0 => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    last_mul = Some((i, "//"));
+                    i += 1; // skip second '/'
+                } else {
+                    last_mul = Some((i, "/"));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    // Try additive (lower precedence) first
+    if let Some((pos, op)) = last_add {
+        let lhs = eval_dim_param_expr(&cur[..pos], overrides)?;
+        let rhs = eval_dim_param_expr(&cur[pos + 1..], overrides)?;
+        let result = if op == b'+' {
+            lhs as i64 + rhs as i64
+        } else {
+            lhs as i64 - rhs as i64
+        };
+        return if result >= 0 {
+            Some(result as u32)
+        } else {
+            None
+        };
+    }
+
+    // Then multiplicative
+    if let Some((pos, op)) = last_mul {
+        let lhs = eval_dim_param_expr(&cur[..pos], overrides)?;
+        let rhs = eval_dim_param_expr(&cur[pos + op.len()..], overrides)?;
+        if rhs == 0 {
+            return None;
+        }
+        let result = match op {
+            "*" => lhs as i64 * rhs as i64,
+            "/" => lhs as i64 / rhs as i64,
+            "//" => (lhs as i64).div_euclid(rhs as i64),
+            _ => return None,
+        };
+        return if result >= 0 {
+            Some(result as u32)
+        } else {
+            None
+        };
+    }
+
+    None
 }
 
 /// Convert an ONNX file and validate via rustnn ORT `MLGraphBuilder::build()`.
@@ -1115,7 +1374,8 @@ pub fn convert_onnx<P: AsRef<Path>>(
     // We cache each external file in memory (read once, slice many times).
     if let Some(graph) = model.graph.as_mut() {
         let model_dir = onnx_path_ref.parent().unwrap_or(std::path::Path::new("."));
-        let mut file_cache: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+        let mut file_cache: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
         for initializer in graph.initializer.iter_mut() {
             if initializer.data_location != 1 || !initializer.raw_data.is_empty() {
                 continue;
@@ -1145,7 +1405,11 @@ pub fn convert_onnx<P: AsRef<Path>>(
                     file_cache.entry(loc.clone()).or_insert(bytes)
                 };
                 let start = offset as usize;
-                let end = if let Some(len) = length { (offset + len) as usize } else { file_bytes.len() };
+                let end = if let Some(len) = length {
+                    (offset + len) as usize
+                } else {
+                    file_bytes.len()
+                };
                 initializer.raw_data = file_bytes[start..end].to_vec();
                 initializer.data_location = 0;
             }
@@ -1196,14 +1460,31 @@ pub fn convert_onnx<P: AsRef<Path>>(
 /// `rustnn::load_graph_from_path()` + `MLGraphBuilder::build_graph_info()`.
 pub fn convert_onnx_save_webnn<P: AsRef<Path>>(
     onnx_path: P,
-    mut options: ConvertOptions,
+    options: ConvertOptions,
     output_webnn: &str,
     output_weights: &str,
     output_manifest: &str,
 ) -> Result<(), OnnxError> {
+    convert_onnx_save_webnn_with_reuse(
+        onnx_path,
+        options,
+        output_webnn,
+        output_weights,
+        output_manifest,
+        &[],
+    )
+}
+
+pub fn convert_onnx_save_webnn_with_reuse<P: AsRef<Path>>(
+    onnx_path: P,
+    mut options: ConvertOptions,
+    output_webnn: &str,
+    output_weights: &str,
+    output_manifest: &str,
+    reuse_sources: &[webnn_graph::weights_io::ReusableWeightsSource],
+) -> Result<(), OnnxError> {
     use rustnn::webnn_json::to_graph_json;
-    use webnn_graph::serialize::{serialize_graph_to_wg_text as _wg_text_unused, SerializeOptions as _};
-    use webnn_graph::weights_io::extract_weights;
+    use webnn_graph::weights_io::{extract_weights, extract_weights_with_reuse};
 
     let onnx_path_ref = onnx_path.as_ref();
     let onnx_bytes = fs::read(onnx_path_ref)?;
@@ -1213,7 +1494,8 @@ pub fn convert_onnx_save_webnn<P: AsRef<Path>>(
     // Load external weights (same as convert_onnx)
     if let Some(graph) = model.graph.as_mut() {
         let model_dir = onnx_path_ref.parent().unwrap_or(Path::new("."));
-        let mut file_cache: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+        let mut file_cache: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
         for initializer in graph.initializer.iter_mut() {
             if initializer.data_location != 1 || !initializer.raw_data.is_empty() {
                 continue;
@@ -1235,13 +1517,19 @@ pub fn convert_onnx_save_webnn<P: AsRef<Path>>(
                 } else {
                     let data_path = model_dir.join(&loc);
                     let bytes = fs::read(&data_path).map_err(|e| {
-                        OnnxError::IoError(std::io::Error::new(e.kind(),
-                            format!("external data '{}': {e}", data_path.display())))
+                        OnnxError::IoError(std::io::Error::new(
+                            e.kind(),
+                            format!("external data '{}': {e}", data_path.display()),
+                        ))
                     })?;
                     file_cache.entry(loc.clone()).or_insert(bytes)
                 };
                 let start = offset as usize;
-                let end = if let Some(len) = length { (offset + len) as usize } else { file_bytes.len() };
+                let end = if let Some(len) = length {
+                    (offset + len) as usize
+                } else {
+                    file_bytes.len()
+                };
                 initializer.raw_data = file_bytes[start..end].to_vec();
                 initializer.data_location = 0;
             }
@@ -1255,10 +1543,17 @@ pub fn convert_onnx_save_webnn<P: AsRef<Path>>(
         if sidecar.exists() {
             let content = fs::read_to_string(&sidecar)?;
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(obj) = json.get("freeDimensionOverrides").unwrap_or(&json).as_object() {
+                if let Some(obj) = json
+                    .get("freeDimensionOverrides")
+                    .unwrap_or(&json)
+                    .as_object()
+                {
                     for (name, value) in obj {
                         if let Some(v) = value.as_u64() {
-                            options.free_dim_overrides.entry(name.clone()).or_insert(v as u32);
+                            options
+                                .free_dim_overrides
+                                .entry(name.clone())
+                                .or_insert(v as u32);
                         }
                     }
                 }
@@ -1275,19 +1570,25 @@ pub fn convert_onnx_save_webnn<P: AsRef<Path>>(
 
     // Extract inline weight bytes to .weights + .manifest.json, get updated graph with @weights() refs
     let output_dir = Path::new(output_weights).parent().unwrap_or(Path::new("."));
-    let graph_json_with_refs = extract_weights(
-        &graph_json,
-        output_dir.to_str().unwrap_or("."),
-        output_weights,
-        output_manifest,
-    ).map_err(|e| OnnxError::ShapeInference(format!("extract_weights: {e}")))?;
+    let graph_json_with_refs = if reuse_sources.is_empty() {
+        extract_weights(
+            &graph_json,
+            output_dir.to_str().unwrap_or("."),
+            output_weights,
+            output_manifest,
+        )
+    } else {
+        extract_weights_with_reuse(&graph_json, output_weights, output_manifest, reuse_sources)
+    }
+    .map_err(|e| OnnxError::ShapeInference(format!("extract_weights: {e}")))?;
 
     // Write as JSON (preserves intermediate_shapes for lossless round-trip).
     // The .webnn text format doesn't support intermediate_shapes.
     let json = serde_json::to_string_pretty(&graph_json_with_refs)
         .map_err(|e| OnnxError::ShapeInference(format!("json serialize: {e}")))?;
-    fs::write(output_webnn, json)
-        .map_err(|e| OnnxError::IoError(std::io::Error::new(e.kind(), format!("write webnn: {e}"))))?;
+    fs::write(output_webnn, json).map_err(|e| {
+        OnnxError::IoError(std::io::Error::new(e.kind(), format!("write webnn: {e}")))
+    })?;
 
     Ok(())
 }
@@ -1300,17 +1601,17 @@ fn extract_graph_info_from_model(
     let converter = OnnxConverter::new(model.clone())?;
     converter.extract_metadata()?;
 
-    let mut context = MLContext::create(&MLContextOptions::new(
-        MLPowerPreference::Default,
-        false,
-    )).map_err(|e| OnnxError::ShapeInference(format!("MLContext::create failed: {e}")))?;
+    let mut context = MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, false))
+        .map_err(|e| OnnxError::ShapeInference(format!("MLContext::create failed: {e}")))?;
 
     let mut ml_builder = MLGraphBuilder::new(&mut context).map_err(map_rustnn_error)?;
     let mut onnx_builder = OnnxBuilder::new(&mut ml_builder);
 
     converter.convert_with_builder(&mut onnx_builder, options)?;
 
-    let onnx_graph = model.graph.as_ref()
+    let onnx_graph = model
+        .graph
+        .as_ref()
         .ok_or_else(|| OnnxError::ProtobufError("Missing graph".to_string()))?;
 
     let mut outputs: HashMap<String, MLOperand> = HashMap::new();
@@ -1322,7 +1623,9 @@ fn extract_graph_info_from_model(
     let output_refs: HashMap<&str, MLOperand> =
         outputs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
 
-    ml_builder.finalize_to_graph_info(&output_refs).map_err(map_rustnn_error)
+    ml_builder
+        .finalize_to_graph_info(&output_refs)
+        .map_err(map_rustnn_error)
 }
 
 /// Lower ONNX to [`MLGraphBuilder`] and validate with ORT `build()`.

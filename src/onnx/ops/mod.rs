@@ -29,13 +29,14 @@ pub mod conditional;
 pub mod conv;
 pub mod conversion;
 pub mod elementwise;
+pub mod lstm;
 pub mod matmul;
 pub mod normalization;
 pub mod pad;
 pub mod pool;
+pub mod quantization;
 pub mod reduction;
 pub mod reshape;
-pub mod quantization;
 pub mod scatter;
 pub mod utility;
 
@@ -45,13 +46,14 @@ use conditional::ConditionalHandler;
 use conv::ConvHandler;
 use conversion::ConversionHandler;
 use elementwise::ElementwiseHandler;
+use lstm::LstmHandler;
 use matmul::MatMulHandler;
 use normalization::NormalizationHandler;
 use pad::PadHandler;
 use pool::PoolHandler;
+use quantization::QuantizationHandler;
 use reduction::ReductionHandler;
 use reshape::ReshapeHandler;
-use quantization::QuantizationHandler;
 use scatter::ScatterHandler;
 use utility::UtilityHandler;
 
@@ -135,6 +137,10 @@ pub fn empty_value_shape_dims() -> &'static HashMap<String, Vec<rustnn::graph::D
 pub struct ConversionResult {
     /// ONNX output name -> data type (for downstream shape inference)
     pub output_types: HashMap<String, rustnn::DataType>,
+    /// ONNX output name -> static shape (for downstream shape inference)
+    pub output_shapes: HashMap<String, Vec<i64>>,
+    /// ONNX output name -> folded integer constant values
+    pub const_values: HashMap<String, Vec<i64>>,
 }
 
 /// Trait for handling ONNX operator conversion
@@ -161,6 +167,7 @@ impl OpRegistry {
     pub fn new() -> Self {
         let handlers: Vec<Box<dyn OpHandler>> = vec![
             Box::new(MatMulHandler),
+            Box::new(LstmHandler),
             Box::new(ConvHandler),
             Box::new(PoolHandler),
             Box::new(ElementwiseHandler),
@@ -274,8 +281,8 @@ fn register_test_operand(
     context: &ConversionContext,
     name: &str,
 ) -> Result<(), OnnxError> {
-    use rustnn::DataType;
     use crate::onnx::convert::{map_onnx_data_type, sanitize_identifier};
+    use rustnn::DataType;
 
     let sanitized = sanitize_identifier(name);
     if builder.resolve_operand(name).is_ok() {
@@ -317,7 +324,12 @@ fn register_test_operand(
     let shape = context
         .resolve_shape(name)
         .map(|s| i64_shape_to_dims(s))
-        .unwrap_or_else(|| vec![rustnn::graph::Dimension::Static(2), rustnn::graph::Dimension::Static(2)]);
+        .unwrap_or_else(|| {
+            vec![
+                rustnn::graph::Dimension::Static(2),
+                rustnn::graph::Dimension::Static(2),
+            ]
+        });
     let dtype = context
         .value_types
         .get(name)
@@ -336,13 +348,10 @@ pub fn convert_handler_with_context(
     use crate::onnx::builder::{map_rustnn_error, OnnxBuilder};
     use rustnn::mlcontext::{MLContext, MLContextOptions, MLGraphBuilder, MLPowerPreference};
 
-    let mut ml_context = MLContext::create(&MLContextOptions::new(
-        MLPowerPreference::Default,
-        false,
-    ))
-    .map_err(|e| OnnxError::ShapeInference(format!("MLContext::create failed: {e}")))?;
-    let mut ml_builder =
-        MLGraphBuilder::new(&mut ml_context).map_err(map_rustnn_error)?;
+    let mut ml_context =
+        MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, false))
+            .map_err(|e| OnnxError::ShapeInference(format!("MLContext::create failed: {e}")))?;
+    let mut ml_builder = MLGraphBuilder::new(&mut ml_context).map_err(map_rustnn_error)?;
     let mut builder = OnnxBuilder::new(&mut ml_builder);
     for input in node.input.iter() {
         if input.is_empty() {

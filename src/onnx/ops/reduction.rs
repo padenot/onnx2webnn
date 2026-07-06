@@ -35,7 +35,8 @@ impl OpHandler for ReductionHandler {
         let node_name = if !node.name.is_empty() {
             node.name.clone()
         } else {
-            node.output.first()
+            node.output
+                .first()
                 .map(|s| crate::onnx::convert::sanitize_identifier(s))
                 .unwrap_or_else(|| node.op_type.to_string())
         };
@@ -72,7 +73,8 @@ impl ReductionHandler {
             &mut rustnn::mlgraphbuilder::MLGraphBuilder<'_, '_>,
             rustnn::mlcontext::MLOperand,
             MLReduceOptions,
-        ) -> Result<rustnn::mlcontext::MLOperand, rustnn::error::GraphBuilderError>,
+        )
+            -> Result<rustnn::mlcontext::MLOperand, rustnn::error::GraphBuilderError>,
     ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.input.as_slice();
         if inputs.is_empty() {

@@ -47,7 +47,8 @@ impl OpHandler for PoolHandler {
         let node_name = if !node.name.is_empty() {
             node.name.as_str().to_string()
         } else {
-            node.output.first()
+            node.output
+                .first()
                 .map(|s| crate::onnx::convert::sanitize_identifier(s))
                 .unwrap_or_else(|| node.op_type.to_string())
         };
@@ -378,12 +379,7 @@ impl PoolHandler {
         let reshape_in_label = sanitize_identifier(&format!("{node_name}_x4d"));
         let pool_label = sanitize_identifier(&format!("{node_name}_pool2d"));
 
-        let in_4d = i64_slice_to_mldim(&[
-            input_shape[0],
-            input_shape[1],
-            input_shape[2],
-            1,
-        ])?;
+        let in_4d = i64_slice_to_mldim(&[input_shape[0], input_shape[1], input_shape[2], 1])?;
         let input = b.resolve_operand(input_raw)?;
         let x4d = b
             .builder
@@ -425,11 +421,7 @@ impl PoolHandler {
         let out_3d = i64_slice_to_mldim(&[input_shape[0], input_shape[1], spatial_out])?;
         let final_out = b
             .builder
-            .reshape_with_options(
-                pooled,
-                out_3d,
-                OnnxBuilder::labeled_options(output_name),
-            )
+            .reshape_with_options(pooled, out_3d, OnnxBuilder::labeled_options(output_name))
             .map_err(map_op_error)?;
 
         if let Some(onnx_out) = node.output.first() {
@@ -523,8 +515,7 @@ impl PoolHandler {
                 .map_err(map_op_error)?;
                 b.record_operand(&[&pool_label], pooled);
 
-                let out_3d =
-                    i64_slice_to_mldim(&[input_shape[0], input_shape[1], 1])?;
+                let out_3d = i64_slice_to_mldim(&[input_shape[0], input_shape[1], 1])?;
                 let final_out = b
                     .builder
                     .reshape_with_options(

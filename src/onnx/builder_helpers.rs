@@ -5,10 +5,10 @@
 
 //! Shared helpers for direct [`MLGraphBuilder`] lowering (no Node IR).
 
-use rustnn::graph::{Dimension, DynamicDimension};
 use crate::onnx::builder::{map_op_error, operand_index, OnnxBuilder};
 use crate::onnx::convert::{sanitize_identifier, OnnxError};
 use crate::protos::onnx::{TensorProto, TensorProto_DataType};
+use rustnn::graph::{Dimension, DynamicDimension};
 use rustnn::mlcontext::MLOperand;
 use rustnn::operator_options::{MLDimension, MLDynamicDimension, MLSliceOptions};
 use serde_json::{json, Value};
@@ -160,7 +160,9 @@ pub fn optional_operand_index(
     }
 }
 
-pub fn map_op_result<T>(result: Result<T, rustnn::error::GraphBuilderError>) -> Result<T, OnnxError> {
+pub fn map_op_result<T>(
+    result: Result<T, rustnn::error::GraphBuilderError>,
+) -> Result<T, OnnxError> {
     result.map_err(map_op_error)
 }
 

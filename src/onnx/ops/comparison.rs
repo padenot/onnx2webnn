@@ -18,12 +18,12 @@
 
 // Comparison operators: Greater, Less, Equal, GreaterOrEqual, LessOrEqual
 
-use rustnn::DataType;
 use crate::onnx::builder::{map_op_error, OnnxBuilder};
 use crate::onnx::convert::{sanitize_identifier, OnnxError};
 use crate::onnx::ops::{ConversionContext, ConversionResult, OpHandler};
 use crate::protos::onnx::NodeProto;
 use rustnn::mlcontext::MLOperand;
+use rustnn::DataType;
 
 pub struct ComparisonHandler;
 
@@ -31,8 +31,15 @@ impl OpHandler for ComparisonHandler {
     fn supports(&self, op_type: &str) -> bool {
         matches!(
             op_type,
-            "Greater" | "Less" | "Equal" | "GreaterOrEqual" | "LessOrEqual"
-                | "And" | "Or" | "Xor" | "Not"
+            "Greater"
+                | "Less"
+                | "Equal"
+                | "GreaterOrEqual"
+                | "LessOrEqual"
+                | "And"
+                | "Or"
+                | "Xor"
+                | "Not"
         )
     }
 
@@ -46,7 +53,8 @@ impl OpHandler for ComparisonHandler {
         let node_name = if !node.name.is_empty() {
             node.name.as_str().to_string()
         } else {
-            node.output.first()
+            node.output
+                .first()
                 .map(|s| crate::onnx::convert::sanitize_identifier(s))
                 .unwrap_or_else(|| node.op_type.to_string())
         };
@@ -66,13 +74,18 @@ impl OpHandler for ComparisonHandler {
             }
             let input0 = b.resolve_operand(&inputs[0])?;
             let opts = OnnxBuilder::labeled_options(&output_name);
-            let out = b.builder.logical_not_with_options(input0, opts).map_err(map_op_error)?;
+            let out = b
+                .builder
+                .logical_not_with_options(input0, opts)
+                .map_err(map_op_error)?;
             if let Some(output) = node.output.as_slice().first() {
                 b.record_operand(&[output.as_str(), &output_name], out);
             }
             let mut result = ConversionResult::default();
             if let Some(output) = node.output.as_slice().first() {
-                result.output_types.insert(output.to_string(), DataType::Uint8);
+                result
+                    .output_types
+                    .insert(output.to_string(), DataType::Uint8);
             }
             return Ok(result);
         }
@@ -136,9 +149,18 @@ fn emit_comparison(
             .builder
             .lesser_or_equal_with_options(a, b_in, opts)
             .map_err(map_op_error)?,
-        "And" => b.builder.logical_and_with_options(a, b_in, opts).map_err(map_op_error)?,
-        "Or" => b.builder.logical_or_with_options(a, b_in, opts).map_err(map_op_error)?,
-        "Xor" => b.builder.logical_xor_with_options(a, b_in, opts).map_err(map_op_error)?,
+        "And" => b
+            .builder
+            .logical_and_with_options(a, b_in, opts)
+            .map_err(map_op_error)?,
+        "Or" => b
+            .builder
+            .logical_or_with_options(a, b_in, opts)
+            .map_err(map_op_error)?,
+        "Xor" => b
+            .builder
+            .logical_xor_with_options(a, b_in, opts)
+            .map_err(map_op_error)?,
         _ => {
             return Err(OnnxError::UnsupportedOp {
                 op: op_type.to_string(),
