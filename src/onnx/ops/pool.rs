@@ -559,8 +559,8 @@ impl PoolHandler {
                     ..Default::default()
                 };
                 let out = match kind {
-                    PoolKind::Max => b.builder.global_max_pool_with_options(input, opts),
-                    PoolKind::Average => b.builder.global_average_pool_with_options(input, opts),
+                    PoolKind::Max => b.builder.max_pool2d_with_options(input, opts),
+                    PoolKind::Average => b.builder.average_pool2d_with_options(input, opts),
                     PoolKind::L2 => unreachable!("GlobalLpPool handled above"),
                 }
                 .map_err(map_op_error)?;

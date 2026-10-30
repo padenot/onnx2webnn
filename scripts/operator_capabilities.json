@@ -402,7 +402,7 @@
   {
     "name": "Einsum",
     "status": "Decomposed",
-    "scope": "Static reduce/transpose/reshape/matmul decomposition; at most two inputs, no ellipsis or repeated labels within a term.",
+    "scope": "Static reduce/transpose/reshape/matmul decomposition; at most two inputs, explicit-output ellipsis on one input, no repeated labels within a term.",
     "perf_impact": "not inferred",
     "perf_limited": false,
     "domain": "ai.onnx"

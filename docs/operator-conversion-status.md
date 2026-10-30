@@ -1,7 +1,7 @@
 # ONNX → WebNN operator conversion status
 
-> **Last edited:** `2026-10-20T10:04:36Z`<br>
-> **Checkout:** `validation-enhancements` at `59d28c6`
+> **Last edited:** `2026-10-30T13:56:50Z`<br>
+> **Checkout:** `main` at `b39e4be`
 >
 > **Freshness:** Use this document only when this provenance is recent relative to the relevant
 > code and commits; otherwise verify the implementation, tests, and Git history before relying
@@ -114,7 +114,7 @@ The generated Python supported-op data derives from the same Rust catalog.
 | `Div` | Direct WebNN | Direct standardized WebNN primitive; handler schema checks and WebNN operand-type limits apply. |  |  |
 | `Dropout` | Unsupported | No current inference lowering; exporters may remove applicable training artifacts. |  |  |
 | `DynamicQuantizeLinear` | Decomposed | Reduction/arithmetic decomposition followed by WebNN quantizeLinear. | moderate |  |
-| `Einsum` | Decomposed | Static reduce/transpose/reshape/matmul decomposition; at most two inputs, no ellipsis or repeated labels within a term. | not inferred |  |
+| `Einsum` | Decomposed | Static reduce/transpose/reshape/matmul decomposition; at most two inputs, explicit-output ellipsis on one input, no repeated labels within a term. | not inferred |  |
 | `Elu` | Direct WebNN | Direct standardized WebNN primitive; handler schema checks and WebNN operand-type limits apply. |  |  |
 | `Equal` | Direct WebNN | Direct standardized WebNN primitive; handler schema checks and WebNN operand-type limits apply. |  |  |
 | `Erf` | Direct WebNN | Direct standardized WebNN primitive; handler schema checks and WebNN operand-type limits apply. |  |  |

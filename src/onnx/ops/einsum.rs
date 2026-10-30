@@ -16,7 +16,7 @@
 //     the requested output order,
 //   * the single-input case is a reduce-sum plus transpose.
 //
-// Rejected: ellipsis ("..."), repeated labels within one operand (diagonals),
+// Rejected: ellipses shared between inputs, repeated labels within one operand (diagonals),
 // more than two inputs, and operands whose static shapes are unknown.
 
 use crate::onnx::builder::{map_op_error, OnnxBuilder};
@@ -154,9 +154,40 @@ pub(crate) fn parse_einsum_equation(
     })
 }
 
+fn expand_single_ellipsis(equation: &str, ranks: &[usize]) -> Option<String> {
+    let equation: String = equation.chars().filter(|c| !c.is_whitespace()).collect();
+    if !equation.contains("...") {
+        return Some(equation);
+    }
+    let (lhs, rhs) = equation.split_once("->")?;
+    let terms: Vec<&str> = lhs.split(',').collect();
+    if terms.len() != ranks.len() || terms.iter().filter(|t| t.contains("...")).count() != 1 {
+        return None;
+    }
+    let position = terms.iter().position(|t| t.contains("..."))?;
+    let explicit = terms[position]
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic())
+        .count();
+    let count = ranks[position].checked_sub(explicit)?;
+    let labels: String = ('a'..='z')
+        .chain('A'..='Z')
+        .filter(|&c| !equation.contains(c))
+        .take(count)
+        .collect();
+    if labels.len() != count || !rhs.contains("...") {
+        return None;
+    }
+    Some(equation.replace("...", &labels))
+}
+
 /// Static output shape for an einsum node, for shape inference.
 pub(crate) fn einsum_output_shape(equation: &str, input_shapes: &[Vec<i64>]) -> Option<Vec<i64>> {
-    let parsed = parse_einsum_equation(equation, input_shapes.len(), "shape-inference").ok()?;
+    let equation = expand_single_ellipsis(
+        equation,
+        &input_shapes.iter().map(Vec::len).collect::<Vec<_>>(),
+    )?;
+    let parsed = parse_einsum_equation(&equation, input_shapes.len(), "shape-inference").ok()?;
     let mut dims: Vec<(char, i64)> = Vec::new();
     for (spec, shape) in parsed.input_specs.iter().zip(input_shapes) {
         if spec.len() != shape.len() {
@@ -213,6 +244,16 @@ fn convert_einsum(
             node_name.to_string(),
         ));
     }
+    let ranks: Vec<usize> = inputs
+        .iter()
+        .map(|name| {
+            lookup_shape(name, context).map(|s| s.len()).ok_or_else(|| {
+                OnnxError::InvalidShape(format!("Einsum requires a known rank for '{name}'"))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let equation = expand_single_ellipsis(&equation, &ranks)
+        .ok_or_else(|| OnnxError::unsupported_op("Einsum(ellipsis)", node_name.to_string()))?;
     let parsed = parse_einsum_equation(&equation, inputs.len(), node_name)?;
 
     let label = output_label(node, node_name);
@@ -490,6 +531,16 @@ mod tests {
             value_types: &value_types,
         };
         crate::onnx::ops::convert_handler_with_context(&EinsumHandler, &node, &context)
+    }
+
+    #[test]
+    fn converts_roformer_outer_product_with_ellipsis() {
+        assert_eq!(
+            einsum_output_shape("..., f -> ... f", &[vec![2, 3], vec![4]]),
+            Some(vec![2, 3, 4])
+        );
+        convert_with_shapes("..., f -> ... f", &[("x", vec![2, 3]), ("f", vec![4])]).unwrap();
+        assert!(einsum_output_shape("...i,...i->...", &[vec![2, 3], vec![2, 3]]).is_none());
     }
 
     #[test]

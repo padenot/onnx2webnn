@@ -55,6 +55,13 @@ Set `O2W_CACHE_DIR`, `O2W_ONNX_CACHE`, or `O2W_WEBNN_CACHE` to override location
 `--validate-cached` reloads existing artifacts without reconversion and is exclusive with
 `--validate`, `--build-and-export`, and `--no-backend-graph-build`.
 
+Single-input ONNX `Concat` is forwarded directly. One-dimensional `ConvTranspose` uses the
+builder's inferred output dimensions when removing the emulation's trailing unit dimension.
+Static `Einsum` supports an explicit-output ellipsis on one input, including outer products
+such as `..., f -> ... f`; ellipses shared between inputs remain unsupported. Floating-point
+arithmetic stays out of the integer shape-constant evaluator, including casts of integral
+values followed by division.
+
 WebNN lacks fused `MatMulNBits`; conversion dequantizes packed q4/q8 weights before floating-point
 matmul. ORT `accuracy_level=4` can instead use Int8 activations, so numerical parity is not assured.
 

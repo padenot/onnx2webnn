@@ -2906,7 +2906,14 @@ fn fold_shape_constants(
                         }
                     }
                 }
-            } else if matches!(op_type, "Add" | "Sub" | "Mul" | "Div" | "Mod") {
+            } else if matches!(op_type, "Add" | "Sub" | "Mul" | "Div" | "Mod")
+                && node.input.iter().all(|name| {
+                    !matches!(
+                        value_types.get(name),
+                        Some(DataType::Float32 | DataType::Float16)
+                    )
+                })
+            {
                 if node.input.as_slice().len() >= 2 {
                     if let (Some(a_name), Some(b_name), Some(out)) = (
                         node.input.as_slice().first(),
@@ -3589,7 +3596,14 @@ fn fold_shape_constants(
                         }
                     }
                 }
-            } else if matches!(op_type, "Add" | "Sub" | "Mul" | "Div" | "Mod") {
+            } else if matches!(op_type, "Add" | "Sub" | "Mul" | "Div" | "Mod")
+                && node.input.iter().all(|name| {
+                    !matches!(
+                        value_types.get(name),
+                        Some(DataType::Float32 | DataType::Float16)
+                    )
+                })
+            {
                 // Integer arithmetic over folded shape scalars/vectors (e.g.
                 // `Mul(Gather(Shape(x), 0), num_heads)` in attention reshape chains).
                 if node.input.as_slice().len() >= 2 {
@@ -4792,6 +4806,42 @@ mod tests {
             infer_node_output_shape(&node, &value_shapes, &HashMap::new(), &HashMap::new()),
             Some(vec![1, 16, 16, 16])
         );
+    }
+
+    #[test]
+    fn floating_division_of_integral_constants_is_not_integer_folded() {
+        let graph = GraphProto {
+            node: vec![NodeProto {
+                op_type: "Div".into(),
+                input: vec!["a".into(), "b".into()],
+                output: vec!["fraction".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for dtype in [DataType::Float32, DataType::Float16, DataType::Int64] {
+            for options in [
+                FoldShapeConstantsOptions::early_pass(),
+                FoldShapeConstantsOptions::from_propagate(&PropagateOptions {
+                    optimize: true,
+                    experimental_dynamic_inputs: false,
+                }),
+            ] {
+                let mut shapes = HashMap::from([("a".into(), vec![3]), ("b".into(), vec![])]);
+                let mut types = HashMap::from([("a".into(), dtype), ("b".into(), dtype)]);
+                let mut constants =
+                    HashMap::from([("a".into(), vec![0, 1, 2]), ("b".into(), vec![256])]);
+                fold_shape_constants(
+                    &graph,
+                    &mut shapes,
+                    &mut types,
+                    &mut constants,
+                    &mut HashMap::new(),
+                    &options,
+                );
+                assert_eq!(constants.contains_key("fraction"), dtype == DataType::Int64);
+            }
+        }
     }
 
     #[test]

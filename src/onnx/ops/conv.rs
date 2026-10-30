@@ -736,26 +736,15 @@ impl ConvHandler {
         };
         b.record_operand(&[&conv_label], conv_out);
 
-        let strides = attrs_2d.strides.clone().unwrap_or_else(|| vec![1, 1]);
-        let dilations = attrs_2d.dilations.clone().unwrap_or_else(|| vec![1, 1]);
-        let pads = attrs_2d.pads.clone().unwrap_or_else(|| vec![0, 0, 0, 0]);
-        let effective_pads = if attrs.auto_pad == "VALID" {
-            vec![0, 0, 0, 0]
-        } else if map_auto_pad(&attrs.auto_pad) == "explicit" {
-            onnx_pads_to_webnn(&pads, 2)
-        } else {
-            vec![0, 0, 0, 0]
-        };
-        let kernel_h = filter_shape[2];
-        let spatial_out = conv2d_spatial_out(
-            input_shape[2],
-            kernel_h,
-            strides[0],
-            dilations[0],
-            effective_pads[0],
-            effective_pads[1],
-        );
-        let out_3d = i64_slice_to_mldim(&[input_shape[0], filter_shape[0], spatial_out])?;
+        let output_shape = b
+            .builder
+            .rustnn_operand_shape(conv_out)
+            .map_err(crate::onnx::builder::map_rustnn_error)?;
+        let out_3d = i64_slice_to_mldim(&[
+            output_shape[0] as i64,
+            output_shape[1] as i64,
+            output_shape[2] as i64,
+        ])?;
         let final_out = b
             .builder
             .reshape_with_options(conv_out, out_3d, OnnxBuilder::labeled_options(output_name))
@@ -1101,6 +1090,47 @@ mod tests {
         );
 
         crate::onnx::ops::convert_handler_with_context(&h, &node, &ctx).unwrap();
+    }
+
+    #[test]
+    fn conv_transpose1d_uses_inferred_output_shape() {
+        let node = make_node(
+            "ConvTranspose",
+            vec!["x", "w"],
+            vec!["y"],
+            vec![ints_attr("strides", vec![2]), ints_attr("pads", vec![1, 1])],
+        );
+        let initializers = HashMap::new();
+        let value_shapes =
+            HashMap::from([("x".into(), vec![1, 16, 64]), ("w".into(), vec![16, 8, 3])]);
+        let const_values = HashMap::new();
+        let value_ids = HashMap::new();
+        let value_types = HashMap::new();
+        let context = make_context(
+            &initializers,
+            &value_shapes,
+            &const_values,
+            &value_ids,
+            &value_types,
+        );
+        let mut ml_context = rustnn::mlcontext::MLContext::create(
+            &crate::onnx::convert::backend_context_options(
+                crate::onnx::convert::BackendChoice::Ort,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut ml_builder = rustnn::mlcontext::MLGraphBuilder::new(&mut ml_context).unwrap();
+        let mut builder = OnnxBuilder::new(&mut ml_builder);
+        for name in &node.input {
+            crate::onnx::ops::register_test_operand(&mut builder, &context, name).unwrap();
+        }
+        ConvHandler.convert(&node, &context, &mut builder).unwrap();
+        let output = builder.resolve_operand("y").unwrap();
+        assert_eq!(
+            builder.builder.rustnn_operand_shape(output).unwrap(),
+            vec![1, 8, 127]
+        );
     }
 
     #[test]

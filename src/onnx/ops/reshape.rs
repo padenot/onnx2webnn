@@ -934,9 +934,9 @@ impl ReshapeHandler {
         b: &mut OnnxBuilder<'_, '_, '_>,
     ) -> Result<ConversionResult, OnnxError> {
         let inputs = node.input.as_slice();
-        if inputs.len() < 2 {
+        if inputs.is_empty() {
             return Err(OnnxError::InvalidShape(format!(
-                "Concat expects at least 2 inputs, got {}",
+                "Concat expects at least 1 input, got {}",
                 inputs.len()
             )));
         }
@@ -1892,6 +1892,31 @@ mod tests {
 
         crate::onnx::ops::convert_handler_with_context(&handler, &node, &context)
             .expect("expand should convert");
+    }
+
+    #[test]
+    fn test_convert_single_input_concat() {
+        let handler = ReshapeHandler;
+        let mut node = create_test_node("Concat", vec!["a"], vec!["result"]);
+        add_int_attribute(&mut node, "axis", -1);
+        let initializers = std::collections::HashMap::new();
+        let mut value_shapes = std::collections::HashMap::new();
+        value_shapes.insert("a".to_string(), vec![1, 2, 3]);
+        value_shapes.insert("b".to_string(), vec![1, 2, 3]);
+        value_shapes.insert("c".to_string(), vec![1, 2, 3]);
+        let const_values = std::collections::HashMap::new();
+        let value_ids = std::collections::HashMap::new();
+        let value_types = std::collections::HashMap::new();
+        let context = ConversionContext {
+            initializers: &initializers,
+            value_shapes: &value_shapes,
+            value_shape_dims: crate::onnx::ops::empty_value_shape_dims(),
+            const_values: &const_values,
+            value_ids: &value_ids,
+            value_types: &value_types,
+        };
+
+        crate::onnx::ops::convert_handler_with_context(&handler, &node, &context).unwrap();
     }
 
     #[test]
